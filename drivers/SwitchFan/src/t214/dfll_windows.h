@@ -116,11 +116,17 @@ static BOOLEAN SwFanDfllAcquireClocks(PSWFAN_DEVICE d, ULONG *i2c_khz)
      * or the shared I2C5 source. DFLL_REF/SOC use u7.1 divider 14 => 51 MHz.
      * I2C5 uses an integer divider, unlike the DFLL ref/soc source divider. */
     pllp = SwCpuRead(d, 0xa0u); m = pllp & 0x1fu; n = (pllp >> 8) & 0x3ffu;
-    if (!m || !(pllp & (1u << 30)) || (pllp & (1u << 31))) return FALSE;
-    /* T210 PLLP_OUT0 is the VCO output. BASE.DIVP divides OUT2 only. */
-    rate = (38400u * n) / m;
+    SwFanTrace(L"DfllPllpBase", pllp);
+    SwFanTrace(L"DfllClockMKhz", f->Handoff.ClockMKhz);
+    if ((pllp & ((1u << 31) | (1u << 30) | (1u << 27))) !=
+        ((1u << 30) | (1u << 27))) return FALSE;
+    /* Switchroot clk_pll_recalc_rate: with OVERRIDE clear PLLP uses its
+     * fixed 408 MHz hardware configuration, not the software M/N fields.
+     * With OVERRIDE set, OUT0 is the VCO; BASE.DIVP divides OUT2 only. */
+    rate = !(pllp & (1u << 28)) ? 408000u : m ? (38400u * n) / m : 0u;
     if (rate != 408000u) return FALSE;
     i2c = SwDfllReadMap(d, SwDfllI2cSource, 0);
+    SwFanTrace(L"DfllI2cSource", i2c);
     /* Switchroot commonly selects PLLP_OUT0 (0); WinX/Hekate selects
      * CLK_M (6). Preserve the shared I2C5 mux/divider and derive its rate. */
     switch ((i2c >> 29) & 7u) {
@@ -129,9 +135,6 @@ static BOOLEAN SwFanDfllAcquireClocks(PSWFAN_DEVICE d, ULONG *i2c_khz)
     default: return FALSE;
     }
     *i2c_khz = parent / ((i2c & 0xffffu) + 1u);
-    SwFanTrace(L"DfllPllpBase", pllp);
-    SwFanTrace(L"DfllClockMKhz", f->Handoff.ClockMKhz);
-    SwFanTrace(L"DfllI2cSource", i2c);
     SwFanTrace(L"DfllI2cKhz", *i2c_khz);
     f->SavedSources[0] = SwDfllReadMap(d, SwDfllSources, 0);
     f->SavedSources[1] = SwDfllReadMap(d, SwDfllSources, 4);

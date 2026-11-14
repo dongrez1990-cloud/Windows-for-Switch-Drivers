@@ -332,7 +332,7 @@ int main(void)
     pmic_regs[0x26] = 110;  /* 800 mV boot CPU M4 */
     car_regs[0x20 / 4] = 0x20008888u;
     car_regs[0xe0 / 4] = (1u << 30) | (1u << 27) | (2u << 20) | (156u << 8) | 2u; /* 998.4 MHz */
-    car_regs[0xa0 / 4] = (1u<<30) | (1u<<20) | (85u<<8) | 8u; /* OUT0 remains 408 MHz despite DIVP=1 */
+    car_regs[0xa0 / 4] = (1u<<30) | (1u<<27); /* fixed PLLP: software M/N unused */
 
     d.Dfll.Map[SwDfllMmio] = (UCHAR *)dfll_regs;
     d.Dfll.Map[SwDfllSources] = (UCHAR *)sources;
@@ -428,6 +428,8 @@ int main(void)
     assert(dfll_regs[SW_DFLL_I2C_DIV / 4] == 0x00050001u);
     assert(i2c_source == (6u << 29)); /* shared I2C5 parent was not changed */
     assert(SwFanSetPowerMode(&d, 7) == STATUS_SUCCESS);
+    car_regs[0xa0 / 4] = (1u<<30) | (1u<<28) | (1u<<27) | (1u<<20) | (85u<<8) | 8u;
+    /* Software override still uses the OUT0 VCO despite DIVP=1. */
     i2c_source = 4; /* Linux PLLP_OUT0 / 5 = 81.6 MHz */
     assert(SwFanSetPowerMode(&d, 1) == STATUS_SUCCESS);
     assert(dfll_regs[SW_DFLL_I2C_DIV / 4] == 0x00190001u);

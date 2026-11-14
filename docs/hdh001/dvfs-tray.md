@@ -158,3 +158,20 @@ I2C divisors and unchanged shared mux. Native transition acceptance is pending.
 Reference: Switchroot kernel2d0059fd3167a8df756de2aa0489d4aa70a9fc15
 clk-tegra210.c, pll_p_params (TEGRA_PLL_VCO_OUT); WinX ClockLibPrivate.h and
 Tegra210 clock.c document the mux and CLK_M divider.
+
+
+## Fan17: fixed PLLP semantics
+
+Fan16 native mode1 still returned Win32 error21 before its clock-source trace;
+fixed7 recovery succeeded and the native display stayed Code0. The pinned
+Switchroot clk-pll.c (2d0059fd3167a8df756de2aa0489d4aa70a9fc15,
+clk_pll_recalc_rate) treats PLLP with BASE.OVERRIDE clear as fixed408MHz;
+its software M/N fields do not determine the rate. Fan17 follows this rule,
+checks enable/lock/bypass, and retains VCO rate decoding for software override.
+The existing raw clock traces are recorded before rejecting those fields.
+No shared PLLP/I2C source is reprogrammed. Firmware handoff remains version2.
+
+The Fan16 adapter fails the fixed-PLLP fixture with unused M/N=0; the corrected
+adapter passes under ASan/UBSan along with the software-override/DIVP and
+CLK_M/PLLP I2C cases and existing PMIC recovery controls. These are models;
+native switching remains pending.
