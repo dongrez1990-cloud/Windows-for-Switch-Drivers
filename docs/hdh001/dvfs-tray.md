@@ -112,3 +112,24 @@ References: Switchroot kernel `2d0059fd3167a8df756de2aa0489d4aa70a9fc15`, nvgpu
 Microsoft contracts: [WDF timer serialization](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdftimer/ns-wdftimer-_wdf_timer_config),
 [processor times](https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntquerysysteminformation),
 [TaskbarCreated](https://learn.microsoft.com/en-us/windows/win32/shell/taskbar#taskbar-creation-notification).
+
+
+## Main-review integration corrections (2026-11-14)
+
+Build the GPU-enabled SwitchFan with `MESA_TEGRA` set to the current
+mesa-switch-woa/tegra-x1-wddm source directory. The GPU PMIC transport and its
+private ABI remain maintained there; the local t214/gpu_pmic.h forwards to it
+and implements the Windows CPU/power policy.
+
+The main review adds CpuLock around the cooling snapshot's DFLL readback,
+cleans up power notifications even after unsuccessful PLLX restoration, aligns
+the diagnostic DriverVersion with INF15, and expires stale power-tray GPU
+readings. Returning a failure from ReleaseHardware is not a veto of teardown;
+cleanup must not leave callbacks targeting a freed WDF context. CPU source/
+voltage is not forcibly changed from that cleanup path.
+
+Local ASan/UBSan DFLL/clock/PMIC/charge/USB controls, screen-off controls and
+tray API controls passed; these are not real hardware DVFS or stability results.
+The main chat will build/sign the combined package with the current display
+source, start native validation in mode7, and preserve exact pre-install files
+for recovery. SC7 is outside this delivery.

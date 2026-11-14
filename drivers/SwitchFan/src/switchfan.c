@@ -261,8 +261,12 @@ VOID SwFanEvtTimer(WDFTIMER Timer)
         ClockStatus = SwCpuApply(Dev, FALSE);
         SwFanTrace(L"CpuLastError", (ULONG)ClockStatus);
     }
+    /* DFLL sampling writes MON_CTRL, so even this cooling snapshot belongs
+       to the same CPU transaction lock as load hints and rate changes. */
+    SwFanCpuLock(Dev);
     ClockRestored = Dev->CpuConfigured && !Dev->CpuApplied &&
                     NT_SUCCESS(ClockStatus) && SwCpuKhz(Dev) == Dev->BootCpuKhz;
+    SwFanCpuUnlock(Dev);
     SwFanTrace(L"ScreenOffCooling", ScreenOff);
     Status = SwFanReadReg(Dev->Sensor, TMP451_REMOTE, &Remote);
     if (NT_SUCCESS(Status)) {
@@ -579,8 +583,9 @@ NTSTATUS SwFanEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
     PSWFAN_DEVICE Dev = SwFanGetDevice(Device);
     NTSTATUS Status = SwFanEvtSuspend(Device);
     UNREFERENCED_PARAMETER(Translated);
-    /* A CPU still clocked by DFLL retains its resources and PMIC owner. */
-    if (!NT_SUCCESS(Status)) return Status;
+    /* ReleaseHardware cannot veto teardown. Always unregister callbacks and
+       unmap resources, even if restoring PLLX failed. Do not reset DFLL or
+       lower M4 here; propagate the failed restoration instead. */
     /* Power notifications run outside the WDF queue: drain them before unmap. */
     if (Dev->DisplayCallback != NULL) {
         (VOID)PoUnregisterPowerSettingCallback(Dev->DisplayCallback);
@@ -608,7 +613,7 @@ NTSTATUS SwFanEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
         Dev->Dfll.Map[I] = NULL;
     }
 #endif
-    return STATUS_SUCCESS;
+    return Status;
 }
 
 static VOID SwFanStartBacklight(WDFDEVICE Device)
@@ -706,7 +711,10 @@ NTSTATUS SwFanEvtRestart(WDFDEVICE Device)
 VOID SwFanEvtSelfManagedIoCleanup(WDFDEVICE Device)
 {
     PSWFAN_DEVICE Dev = SwFanGetDevice(Device);
-    if (!NT_SUCCESS(SwFanEvtSuspend(Device))) return;
+    NTSTATUS Status = SwFanEvtSuspend(Device);
+    /* WDF can destroy this device after a failed power callback. Never leave
+       the Po callback pointing at a device context that is being freed. */
+    SwFanTrace(L"CpuCleanupStatus", (ULONG)Status);
     if (Dev->Pmic != NULL) { WdfObjectDelete(Dev->Pmic); Dev->Pmic = NULL; }
     Dev->CpuConfigured = FALSE;
     if (Dev->DisplayCallback != NULL) {
@@ -791,7 +799,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwFanParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwFanParamsPath);
     }
-    SwFanTrace(L"DriverVersion", 14);
+    SwFanTrace(L"DriverVersion", 15);
     WDF_DRIVER_CONFIG_INIT(&Config, SwFanEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }

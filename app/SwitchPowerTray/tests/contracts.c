@@ -63,6 +63,19 @@ int wmain(void)
     after[0].KernelTime.QuadPart = -1;
     assert(!CpuBusyPermille(before, after, 4, &busy));
     assert(sizeof(SWFAN_POWER_REQUEST) == 8 && SwFanPowerModeDefaultFixed == 7);
+    /* A stale KMD sample must not be displayed as the current GPU rate. */
+    SWFAN_POWER_STATUS sample = {0};
+    sample.Version = SWFAN_POWER_STATUS_VERSION;
+    sample.GpuReportedKhz = 460800;
+    sample.GpuSampleAgeMs = 2000;
+    sample.Flags = SWFAN_POWER_FLAG_LIVE_GPU_COUNTER;
+    assert(HasFreshGpu(&sample));
+    sample.GpuSampleAgeMs = 2001;
+    assert(!HasFreshGpu(&sample));
+    sample.GpuSampleAgeMs = 0;
+    sample.Flags = 0;
+    assert(!HasFreshGpu(&sample));
+
     assert(WriteRegDword(REG_SETTINGS_KEY, REG_HIDDEN_VALUE, 1u) == ERROR_SUCCESS);
     g_app.CursorHidden = TRUE;
     restore_ok = FALSE;

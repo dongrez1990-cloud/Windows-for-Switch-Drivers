@@ -4,7 +4,7 @@
  * Cursor Auto-Hide tray utility for Nintendo Switch (T210B01 / Windows 11).
  *
  * Original clean-room Win32 implementation:
- *   - Power Mode menu -> \\.\SwitchBacklight (SwitchFan v14 + TegraGpuRender)
+ *   - Power Mode menu -> \\.\SwitchBacklight (SwitchFan v15 + TegraGpuRender)
  *   - Charging Limit menu -> \\.\SwitchBattery (SwitchBattery v12 BQ24193 +-5%
  *     hysteresis: 55% -> 50-60% band, 85% -> 80-90% band, Off -> 100%, keeping
  *     external VBUS input power active without BQ24193 EN_HIZ battery drain)
@@ -472,6 +472,12 @@ static void FormatChargeBandLabel(UINT limitCenter, WCHAR *buf, size_t cch)
     buf[cch - 1] = L'\0';
 }
 
+static BOOL HasFreshGpu(const SWFAN_POWER_STATUS *p)
+{
+    return p->Version == SWFAN_POWER_STATUS_VERSION && p->GpuReportedKhz != 0 &&
+           p->GpuSampleAgeMs <= 2000u && (p->Flags & SWFAN_POWER_FLAG_LIVE_GPU_COUNTER) != 0;
+}
+
 static void FormatPowerHeader(const TRAY_STATE *st, WCHAR *buf, size_t cch)
 {
     if (!st->HavePower) {
@@ -484,7 +490,7 @@ static void FormatPowerHeader(const TRAY_STATE *st, WCHAR *buf, size_t cch)
 
     const SWFAN_POWER_STATUS *p = &st->Power;
     WCHAR gpuPart[96];
-    if (p->GpuReportedKhz != 0) {
+    if (HasFreshGpu(p)) {
         _snwprintf(gpuPart, sizeof(gpuPart) / sizeof(gpuPart[0]),
                    L"GPU %u.%u MHz (%u mV)",
                    p->GpuReportedKhz / 1000u, (p->GpuReportedKhz % 1000u) / 100u,
@@ -497,7 +503,7 @@ static void FormatPowerHeader(const TRAY_STATE *st, WCHAR *buf, size_t cch)
     }
     gpuPart[(sizeof(gpuPart) / sizeof(gpuPart[0])) - 1] = L'\0';
 
-    if (p->TempValid) {
+    if (p->TempValid && p->TempSampleAgeMs <= 6000u) {
         _snwprintf(buf, cch, L"CPU %u.%u MHz (%u mV) | %s | RAM %u MHz | %u C",
                    p->CpuActualKhz / 1000u, (p->CpuActualKhz % 1000u) / 100u,
                    p->CpuMv, gpuPart, p->RamActualKhz / 1000u, p->TempC);
@@ -648,20 +654,23 @@ static void UpdateTrayVisuals(void)
     }
 
     if (g_app.HavePower && g_app.HaveBattery) {
-        UINT gpuKhz = g_app.Power.GpuReportedKhz ? g_app.Power.GpuReportedKhz : g_app.Power.GpuPolicyMaxKhz;
+        WCHAR gpu[32];
+        if (HasFreshGpu(&g_app.Power))
+            _snwprintf(gpu, sizeof(gpu) / sizeof(gpu[0]), L"%uMHz", g_app.Power.GpuReportedKhz / 1000u);
+        else wcscpy_s(gpu, sizeof(gpu) / sizeof(gpu[0]), L"--");
         if (g_app.Battery.LimitCenter != 0) {
             _snwprintf(g_app.Nid.szTip, sizeof(g_app.Nid.szTip) / sizeof(WCHAR),
-                       L"CPU %uMHz GPU %uMHz | Bat %u%% (%u-%u%%)",
+                       L"CPU %uMHz GPU %s | Bat %u%% (%u-%u%%)",
                        g_app.Power.CpuActualKhz / 1000u,
-                       gpuKhz / 1000u,
+                       gpu,
                        g_app.Battery.CapacityPercent,
                        g_app.Battery.BandMin,
                        g_app.Battery.BandMax);
         } else {
             _snwprintf(g_app.Nid.szTip, sizeof(g_app.Nid.szTip) / sizeof(WCHAR),
-                       L"CPU %uMHz GPU %uMHz | Bat %u%% (Limit Off)",
+                       L"CPU %uMHz GPU %s | Bat %u%% (Limit Off)",
                        g_app.Power.CpuActualKhz / 1000u,
-                       gpuKhz / 1000u,
+                       gpu,
                        g_app.Battery.CapacityPercent);
         }
     } else {

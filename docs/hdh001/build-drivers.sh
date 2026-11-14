@@ -17,13 +17,18 @@ for pair in Tegra210Gpio:tegra210gpio Tegra210I2c:tegra210i2c SwitchLiteTouch:sw
     for file in "$driver_dir/src/$name.c" "$src/tools/kmdf_support.c"; do
         obj=${file##*/}; obj=${obj%.c}.obj
         extra_defs=""
-        if [ "$dir" = "SwitchFan" ]; then extra_defs="/DSWITCH_LITE_GPU=1"; fi
+        extra_include=""
+        if [ "$dir" = "SwitchFan" ]; then
+            : "${MESA_TEGRA:?mesa-switch-woa/tegra-x1-wddm source directory}"
+            extra_defs="/DSWITCH_LITE_GPU=1"
+            extra_include="/I$MESA_TEGRA"
+        fi
         "$cc" --target=aarch64-pc-windows-msvc /nologo /c /kernel /GS- /Gy /Zl /O2 /W4 /WX \
             -Wno-unused-parameter -Wno-microsoft-anon-tag -Wno-ignored-pragma-intrinsic \
             -Wno-pragma-pack -Wno-invalid-token-paste -Wno-unknown-pragmas -Wno-ignored-attributes \
             -Wno-nonportable-include-path /D_ARM64_ /DARM64 /D_WIN64 /DNTDDI_VERSION=0x0A000008 \
             /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 /DKMDF_VERSION_MAJOR=1 /DKMDF_VERSION_MINOR=15 \
-            /DPOOL_NX_OPTIN=1 /DSWITCH_LITE_TOUCH=1 $extra_defs "/imsvc$WDK_INCLUDE/km/crt" "/imsvc$WDK_INCLUDE/km" \
+            /DPOOL_NX_OPTIN=1 /DSWITCH_LITE_TOUCH=1 $extra_defs ${extra_include:+"$extra_include"} "/imsvc$WDK_INCLUDE/km/crt" "/imsvc$WDK_INCLUDE/km" \
             "/imsvc$WDK_INCLUDE/shared" "/imsvc$sdk/shared" "/imsvc$sdk/ucrt" "/imsvc$WDK_INCLUDE/km/spb/1.0" "/imsvc$WDF_INCLUDE" \
             "/Fo$dest/$obj" -- "$file"
     done
