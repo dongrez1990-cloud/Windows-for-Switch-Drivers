@@ -18,6 +18,11 @@
 #define CPU_TARGET_N   78u
 #define CPU_TARGET_KHZ (38400u * CPU_TARGET_N / 2u)
 
+#ifndef SWFAN_HAVE_PMIC_LOCK
+static VOID SwFanPmicLock(PSWFAN_DEVICE Dev) { (VOID)Dev; }
+static VOID SwFanPmicUnlock(PSWFAN_DEVICE Dev) { (VOID)Dev; }
+#endif
+
 static ULONG SwCpuRead(PSWFAN_DEVICE Dev, ULONG Offset)
 {
     return READ_REGISTER_ULONG((PULONG)(Dev->Car + Offset));
@@ -53,12 +58,14 @@ static NTSTATUS SwCpuVoltage(PSWFAN_DEVICE Dev, UCHAR Code)
     WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&Memory, Buffer, sizeof(Buffer));
     WDF_REQUEST_SEND_OPTIONS_INIT(&Options, WDF_REQUEST_SEND_OPTION_TIMEOUT);
     Options.Timeout = WDF_REL_TIMEOUT_IN_MS(200);
+    SwFanPmicLock(Dev);
     Status = WdfIoTargetSendWriteSynchronously(Dev->Pmic, NULL, &Memory, NULL, &Options, &Bytes);
-    if (!NT_SUCCESS(Status)) return Status;
-    if (Bytes != sizeof(Buffer)) return STATUS_DEVICE_PROTOCOL_ERROR;
+    if (!NT_SUCCESS(Status)) { SwFanPmicUnlock(Dev); return Status; }
+    if (Bytes != sizeof(Buffer)) { SwFanPmicUnlock(Dev); return STATUS_DEVICE_PROTOCOL_ERROR; }
     Delay.QuadPart = -20000; /* 2 ms; Hekate allows 1 ms for this regulator. */
     KeDelayExecutionThread(KernelMode, FALSE, &Delay);
     Status = SwFanReadReg(Dev->Pmic, CPU_M4_VOUT, &Readback);
+    SwFanPmicUnlock(Dev);
     if (NT_SUCCESS(Status) && Readback != Code) Status = STATUS_DEVICE_DATA_ERROR;
     if (NT_SUCCESS(Status)) SwFanTrace(L"CpuMv", 250 + Code * 5);
     return Status;
@@ -137,7 +144,11 @@ static VOID SwCpuPrepare(WDFDEVICE Device)
     else if (Dev->Config.PmicAddress == 0x33 && Dev->ConnectionCount >= 3) Id = Dev->PmicIds[1];
     else { SwFanTrace(L"CpuLastError", STATUS_DEVICE_CONFIGURATION_ERROR); return; }
     Status = SwFanOpenTarget(Device, Id, &Dev->Pmic);
-    if (NT_SUCCESS(Status)) Status = SwFanReadReg(Dev->Pmic, CPU_M4_VOUT, &Dev->BootVout);
+    if (NT_SUCCESS(Status)) {
+        SwFanPmicLock(Dev);
+        Status = SwFanReadReg(Dev->Pmic, CPU_M4_VOUT, &Dev->BootVout);
+        SwFanPmicUnlock(Dev);
+    }
     if (NT_SUCCESS(Status) && (Dev->BootVout < 70 || Dev->BootVout > CPU_OC_VOUT))
         Status = STATUS_DEVICE_CONFIGURATION_ERROR;
     if (NT_SUCCESS(Status)) {

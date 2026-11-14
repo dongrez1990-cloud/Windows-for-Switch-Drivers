@@ -49,9 +49,14 @@ typedef struct _SWFAN_DEVICE {
     LARGE_INTEGER PmicIds[2];
     ULONG ConnectionCount;
     WDFIOTARGET Pmic;
+    WDFWAITLOCK PmicLock;
     ULONG BootPllx, BootCpuKhz;
     UCHAR BootVout;
     BOOLEAN CpuConfigured, CpuApplied, CpuThrottled, CpuOverclockEnabled;
+    BOOLEAN BaseCpuOverclockEnabled, GpuBridgeSeen;
+    ULONG PowerMode, PolicySeq;
+    volatile LONG GpuDvfsPolicy;
+    ULONG GpuReportedKhz, GpuReportedUv, GpuStatusWord;
     LARGE_INTEGER SensorId;
     WDFIOTARGET Sensor;
     WDFTIMER Timer;
@@ -166,6 +171,18 @@ static NTSTATUS SwFanConfigureSensor(WDFIOTARGET Target)
     return STATUS_SUCCESS;
 }
 
+#define SWFAN_HAVE_PMIC_LOCK 1
+static VOID SwFanPmicLock(PSWFAN_DEVICE Dev)
+{
+    if (Dev->PmicLock != NULL) WdfWaitLockAcquire(Dev->PmicLock, NULL);
+}
+
+static VOID SwFanPmicUnlock(PSWFAN_DEVICE Dev)
+{
+    if (Dev->PmicLock != NULL) WdfWaitLockRelease(Dev->PmicLock);
+}
+
+static VOID SwFanSetDuty(PSWFAN_DEVICE Dev, ULONG Duty);
 #include "t214/clock.h"
 #ifdef SWITCH_LITE_GPU
 #include "t214/gpu_pmic.h"
@@ -317,6 +334,25 @@ VOID SwFanEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLengt
         WdfRequestCompleteWithInformation(Request, Status, Info);
         return;
     }
+    if (Code == IOCTL_SWFAN_GET_POWER_STATUS) {
+        SWFAN_POWER_STATUS *Out;
+        Status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*Out), (PVOID *)&Out, NULL);
+        if (NT_SUCCESS(Status)) {
+            SwFanGetPowerStatus(Dev, Out);
+            Info = sizeof(*Out);
+        }
+        WdfRequestCompleteWithInformation(Request, Status, Info);
+        return;
+    }
+    if (Code == IOCTL_SWFAN_SET_POWER_MODE) {
+        PULONG In;
+        Status = WdfRequestRetrieveInputBuffer(Request, sizeof(ULONG), (PVOID *)&In, NULL);
+        if (NT_SUCCESS(Status)) {
+            Status = SwFanSetPowerMode(Dev, *In);
+        }
+        WdfRequestCompleteWithInformation(Request, Status, 0);
+        return;
+    }
 #endif
     WdfWaitLockAcquire(Dev->BacklightLock, NULL);
     if (Dev->BacklightPwm == NULL) {
@@ -438,6 +474,12 @@ NTSTATUS SwFanEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
     /* Read once per hardware start so a diagnostic does not introduce another
        live clock transition. Zero keeps the inherited CPU clock across lock. */
     Dev->CpuOverclockEnabled = SwFanReadParam(L"CpuOverclockEnabled", 1) != 0;
+    Dev->BaseCpuOverclockEnabled = Dev->CpuOverclockEnabled;
+    Dev->PowerMode = 0;
+    Dev->PolicySeq = 0;
+#ifdef SWITCH_LITE_GPU
+    (VOID)InterlockedExchange(&Dev->GpuDvfsPolicy, (LONG)TG_GPU_DVFS_POLICY_PACK(0, 460800u, 460800u, 0));
+#endif
     SwFanTrace(L"CpuOverclockEnabled", Dev->CpuOverclockEnabled);
     SwFanTrace(L"BacklightAvailable", Dev->BacklightPwm != NULL);
     SwFanTrace(L"CpuHandoffKhz", Dev->Config.CpuKhz);
@@ -631,6 +673,10 @@ NTSTATUS SwFanEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     if (!NT_SUCCESS(Status)) {
         return Status;
     }
+    Status = WdfWaitLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &SwFanGetDevice(Device)->PmicLock);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
     Status = WdfDeviceCreateSymbolicLink(Device, &LinkName);
     SwFanTrace(L"SymbolicLinkStatus", (ULONG)Status);
     if (!NT_SUCCESS(Status)) {
@@ -652,7 +698,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwFanParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwFanParamsPath);
     }
-    SwFanTrace(L"DriverVersion", 13);
+    SwFanTrace(L"DriverVersion", 14);
     WDF_DRIVER_CONFIG_INIT(&Config, SwFanEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }
