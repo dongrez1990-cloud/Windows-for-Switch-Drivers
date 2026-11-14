@@ -133,3 +133,28 @@ tray API controls passed; these are not real hardware DVFS or stability results.
 The main chat will build/sign the combined package with the current display
 source, start native validation in mode7, and preserve exact pre-install files
 for recovery. SC7 is outside this delivery.
+
+
+## First native transition: refused before DFLL activation
+
+The first integrated Fan15 trial successfully reported the version2 power ABI,
+Speedo1630/process0, available DFLL resources and fixed CPU1497.6/GPU460.8/RAM1600.
+Mode1 was refused with Win32 ERROR_NOT_READY (21); the automatic test stopped at
+that first request and verified fixed7 again. No successful dynamic or OC mode
+transition is claimed for Fan15.
+
+The adapter had two incorrect clock assumptions: T210 PLLP_OUT0 is the VCO and
+ignores BASE.DIVP (OUT2 uses that divider), and WinX's I2C5 parent selector6 is
+CLK_M, while the adapter accepted only PLLP. Fan16 derives PLLP_OUT0 correctly
+and supports those two actual mux parents without changing shared I2C5 settings.
+The version2 private firmware handoff adds ClockMKhz, derived from OSC_CTRL and
+SPARE_REG0, so the kernel does not guess a 19.2 MHz rate or read outside its ACPI
+resources. Public power IOCTL ABI remains2; fixed policy7 and display code are
+unchanged. Unknown mux parents/invalid handoff still fail before ownership.
+
+A DIVP=1 negative control fails on the old adapter. Patched ASan/UBSan controls
+cover both Windows CLK_M19.2 and Linux PLLP/5=81.6 MHz parents, the resulting DFLL
+I2C divisors and unchanged shared mux. Native transition acceptance is pending.
+Reference: Switchroot kernel2d0059fd3167a8df756de2aa0489d4aa70a9fc15
+clk-tegra210.c, pll_p_params (TEGRA_PLL_VCO_OUT); WinX ClockLibPrivate.h and
+Tegra210 clock.c document the mux and CLK_M divider.

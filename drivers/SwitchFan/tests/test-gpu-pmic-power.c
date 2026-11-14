@@ -332,7 +332,7 @@ int main(void)
     pmic_regs[0x26] = 110;  /* 800 mV boot CPU M4 */
     car_regs[0x20 / 4] = 0x20008888u;
     car_regs[0xe0 / 4] = (1u << 30) | (1u << 27) | (2u << 20) | (156u << 8) | 2u; /* 998.4 MHz */
-    car_regs[0xa0 / 4] = (1u<<30) | (85u<<8) | 8u; /* 408 MHz PLLP */
+    car_regs[0xa0 / 4] = (1u<<30) | (1u<<20) | (85u<<8) | 8u; /* OUT0 remains 408 MHz despite DIVP=1 */
 
     d.Dfll.Map[SwDfllMmio] = (UCHAR *)dfll_regs;
     d.Dfll.Map[SwDfllSources] = (UCHAR *)sources;
@@ -341,9 +341,9 @@ int main(void)
     d.Dfll.Map[SwDfllBankReset] = (UCHAR *)resets;
     d.Dfll.Map[SwDfllBankEnable] = (UCHAR *)gates;
     d.Dfll.Map[SwDfllI2cSource] = (UCHAR *)&i2c_source;
-    i2c_source = 4; /* integer divide by 5 */
+    i2c_source = 6u << 29; /* Windows CLK_M, integer divider 1 */
     d.Dfll.Handoff = (LITE_DFLL_HANDOFF){LITE_DFLL_HANDOFF_MAGIC, LITE_DFLL_HANDOFF_VERSION,
-        sizeof(LITE_DFLL_HANDOFF), 0x2120, 0x83, 1630, 0, 0x33};
+        sizeof(LITE_DFLL_HANDOFF), 0x2120, 0x83, 1630, 0, 0x33, 19200};
     d.PowerMode = SwFanPowerModeDefaultFixed;
     d.IsLite = TRUE;
     d.BacklightReady = TRUE;
@@ -422,6 +422,18 @@ int main(void)
     op=(struct tg_gpu_pmic_request){0,TG_GPU_PMIC_REPORT_ABI,1,TG_GPU_LIVE_COUNTER_ABI};
     assert(send_gpu_pmic(&d,&op)==STATUS_SUCCESS);
     assert(SwFanDfllAvailable(&d));
+    assert(LiteDfllClockMKhz(5u << 28, 1u << 2) == 19200u);
+    assert(LiteDfllClockMKhz(4u << 28, 1u << 2) == 0u);
+    assert(SwFanSetPowerMode(&d, 1) == STATUS_SUCCESS);
+    assert(dfll_regs[SW_DFLL_I2C_DIV / 4] == 0x00050001u);
+    assert(i2c_source == (6u << 29)); /* shared I2C5 parent was not changed */
+    assert(SwFanSetPowerMode(&d, 7) == STATUS_SUCCESS);
+    i2c_source = 4; /* Linux PLLP_OUT0 / 5 = 81.6 MHz */
+    assert(SwFanSetPowerMode(&d, 1) == STATUS_SUCCESS);
+    assert(dfll_regs[SW_DFLL_I2C_DIV / 4] == 0x00190001u);
+    assert(SwFanSetPowerMode(&d, 7) == STATUS_SUCCESS);
+    i2c_source = 6u << 29;
+
     for (ULONG mode=0; mode < SwNvpCount; ++mode) {
         assert(SwFanSetPowerMode(&d,mode) == STATUS_SUCCESS);
         SwFanGetPowerStatus(&d,&st);

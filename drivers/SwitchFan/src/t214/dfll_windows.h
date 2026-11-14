@@ -86,7 +86,9 @@ static BOOLEAN SwFanDfllAvailable(PSWFAN_DEVICE d)
         h->Size != sizeof(*h) || (h->Hidrev & 0xfff0u) != 0x2120u || h->Sku != 0x83u ||
         !h->CpuSpeedo || h->CpuSpeedo > 5000u || h->CpuProcessId > 1u ||
         h->CpuProcessId != (h->CpuSpeedo < 1650u ? 0u : 1u) ||
-        h->PmicAddress != d->Config.PmicAddress) return FALSE;
+        h->PmicAddress != d->Config.PmicAddress ||
+        (h->ClockMKhz != 9600u && h->ClockMKhz != 12800u &&
+         h->ClockMKhz != 19200u && h->ClockMKhz != 38400u)) return FALSE;
     for (ULONG i = 0; i < SwDfllResourceCount; ++i) if (!d->Dfll.Map[i]) return FALSE;
     return TRUE;
 }
@@ -108,18 +110,29 @@ static BOOLEAN SwFanDfllReleaseClocks(PSWFAN_DEVICE d)
 static BOOLEAN SwFanDfllAcquireClocks(PSWFAN_DEVICE d, ULONG *i2c_khz)
 {
     SWFAN_DFLL *f = &d->Dfll;
-    ULONG pllp, m, n, p, rate, i2c;
+    ULONG pllp, m, n, rate, i2c, parent;
     if (!SwFanDfllAvailable(d) || f->ClocksOwned || SwDfllCpuParent(d) != 1u) return FALSE;
     /* Match Switchroot's fixed 408 MHz PLLP parent, without reprogramming it
      * or the shared I2C5 source. DFLL_REF/SOC use u7.1 divider 14 => 51 MHz.
      * I2C5 uses an integer divider, unlike the DFLL ref/soc source divider. */
-    pllp = SwCpuRead(d, 0xa0u); m = pllp & 0x1fu; n = (pllp >> 8) & 0x3ffu; p = (pllp >> 20) & 7u;
+    pllp = SwCpuRead(d, 0xa0u); m = pllp & 0x1fu; n = (pllp >> 8) & 0x3ffu;
     if (!m || !(pllp & (1u << 30)) || (pllp & (1u << 31))) return FALSE;
-    rate = (38400u * n) / (m * (1u << p));
+    /* T210 PLLP_OUT0 is the VCO output. BASE.DIVP divides OUT2 only. */
+    rate = (38400u * n) / m;
     if (rate != 408000u) return FALSE;
     i2c = SwDfllReadMap(d, SwDfllI2cSource, 0);
-    if (i2c >> 30) return FALSE;
-    *i2c_khz = rate / ((i2c & 0xffffu) + 1u);
+    /* Switchroot commonly selects PLLP_OUT0 (0); WinX/Hekate selects
+     * CLK_M (6). Preserve the shared I2C5 mux/divider and derive its rate. */
+    switch ((i2c >> 29) & 7u) {
+    case 0u: parent = rate; break;
+    case 6u: parent = f->Handoff.ClockMKhz; break;
+    default: return FALSE;
+    }
+    *i2c_khz = parent / ((i2c & 0xffffu) + 1u);
+    SwFanTrace(L"DfllPllpBase", pllp);
+    SwFanTrace(L"DfllClockMKhz", f->Handoff.ClockMKhz);
+    SwFanTrace(L"DfllI2cSource", i2c);
+    SwFanTrace(L"DfllI2cKhz", *i2c_khz);
     f->SavedSources[0] = SwDfllReadMap(d, SwDfllSources, 0);
     f->SavedSources[1] = SwDfllReadMap(d, SwDfllSources, 4);
     f->SavedReset = SwDfllReadMap(d, SwDfllReset, 0);
