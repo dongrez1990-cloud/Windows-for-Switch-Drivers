@@ -3,13 +3,16 @@
 This candidate completes the CPU clock path missing from the original Gemini
 GPU-only delivery (`13eb977`, `9722c5d`, `52aed8d`). SwitchFan 1.0.0.15 owns
 CPU/M4 and the shared SPB connection; TegraGpuRender owns GPU/NAPLL transitions.
-The Windows recovery baseline remains CPU 1497.6 / GPU 460.8 / EMC 1600 MHz.
-No new driver or firmware has been installed by this side conversation.
+The current normal boot, deployment, test and recovery baseline is **Handheld**
+(mode 1), as selected by the user on 2026-11-14. Fan19/Battery12 and the integrated
+display pairing have been installed; the original side-delivery notes below are
+historical. EMC is still at its firmware-provided rate pending runtime integration.
 
 ## Profiles
 
 IDs 0..6 and their requested caps match the captured Switchroot T210B01
-`nvpmodel_t210b01.conf`. ID 7 is a separate Windows recovery profile. These are
+`nvpmodel_t210b01.conf`. ID 7 remains only an internal failure-recovery ABI and is
+removed from the tray menu; normal Reset to Defaults selects Handheld. These are
 caps and floors, not promises that the live clock always equals the cap.
 
 | ID | Profile | CPU min / effective max MHz | GPU min / effective max MHz |
@@ -21,7 +24,6 @@ caps and floors, not promises that the live clock always equals the cap.
 | 4 | OC_All | 102 / 2397 | 76.8 / 1228.8 |
 | 5 | Perf_All | 1224 / 1963.5 | 460.8 / 844.8 |
 | 6 | Perf_OC_All | 1224 / 2397 | 460.8 / 1228.8 |
-| 7 | Windows baseline | fixed 1497.6 | fixed 460.8 |
 
 Switchroot requests 3000000 kHz CPU / 2000000 kHz GPU in its OC profiles. The
 actual SLT/HighOPT tables stop at 2397000/1228800 kHz. The captured Noble GPU
@@ -58,7 +60,11 @@ NtQuerySystemInformation processor-performance layout. This is a Windows load
 hint controller, not Linux's cpufreq governor or Windows PPM integration. Kernel
 code owns frequency, voltage and thermal bounds. Missing hints retain the chosen
 profile ceiling; exiting the tray does not turn off thermal protection. Profiles
-are not persisted across a driver restart/reboot; the baseline is the boot default.
+are not persisted across a driver restart/reboot. The tray's login action selects
+Handheld once the live GPU provider and CPU DFLL are available. Its existing status
+timer waits for readiness; it sends at most one request and cancels that pending
+default if the user chooses a mode first. A failed transition is reported without
+periodically reissuing clock writes.
 
 ## GPU contract and telemetry
 
@@ -89,6 +95,32 @@ Explorer's TaskbarCreated notification recreates icons. Cursor hide/restore keep
 its crash breadcrumb until recovery succeeds. Restore commands return errors
 instead of claiming success when a driver or cursor reset failed. The online
 restore script resets policies/settings, not driver binaries or firmware.
+
+`app/Shared/Install-StartupTask.ps1` registers per-user interactive logon tasks,
+with battery restrictions disabled. Switch Power starts after 10 seconds; Pacecar
+after 60 seconds to follow the login display-driver activation. The installer
+removes their previous Run entries and records each task under
+`HKCU\Software\SwitchWOA\StartupTasks`. Both applications' startup checkboxes
+read and change the task's actual Enabled property. Standalone installs without a
+task mapping retain the Run-key backend. This uses Microsoft's documented
+[interactive task context](https://learn.microsoft.com/en-us/windows/win32/taskschd/security-contexts-for-running-tasks)
+and [Enabled property](https://learn.microsoft.com/en-us/windows/win32/taskschd/registeredtask-enabled)
+(checked 2026-11-14); no password or SYSTEM desktop process is used.
+
+The obsolete `app/SwitchTelemetry` source and desktop executable are removed at
+the user's request. Pacecar's private upstream source is not republished here.
+Hardware Details is available only through its explicit menu item. The former
+tray double-click binding could open the large details dialog during touch or
+rapid clicks; it has been removed. Successful mode/charge changes update status
+silently, while actual IOCTL/readback failures still display an error.
+
+2026-11-14 native startup verification: the planned reboot at 23:46:28 UTC started
+both applications in session 1 through their login tasks. The shared application
+backend successfully disabled/re-enabled both tasks before reboot. Handheld was
+read back with CPU DFLL active, GPU policy 1 and no CPU transition error. GPU
+remained Code0 with the retained tgd3d UMD/ICD. The two desktop shortcuts were
+removed at 23:50:06 UTC, after that verification. This is startup/policy acceptance,
+not EMC DVFS or sustained GPU stability acceptance.
 
 ## Validation and handoff limits
 

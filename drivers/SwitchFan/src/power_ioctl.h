@@ -26,7 +26,7 @@ enum SwFanPowerMode {
     SwFanPowerModeOcAll           = 4,
     SwFanPowerModePerfAll         = 5,
     SwFanPowerModePerfOcAll       = 6,
-    SwFanPowerModeDefaultFixed    = 7, /* separate Windows recovery baseline */
+    SwFanPowerModeDefaultFixed    = 7, /* internal failure recovery; normal baseline is Handheld */
     SwFanPowerModeCount           = 8
 };
 

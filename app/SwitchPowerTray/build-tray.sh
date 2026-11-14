@@ -12,7 +12,7 @@ mkdir -p "$out"
     -std=c11 -O2 -Wall -Wextra -Werror -Wno-format-truncation \
     -municode -mwindows \
     "$src/SwitchPowerTray.c" \
-    -luser32 -lshell32 -ladvapi32 -lgdi32 \
+    -luser32 -lshell32 -ladvapi32 -lgdi32 -lole32 -loleaut32 -luuid \
     -o "$out/SwitchPowerTray.exe"
 "$mingw_bin/aarch64-w64-mingw32-strip" "$out/SwitchPowerTray.exe"
 
@@ -21,13 +21,14 @@ if [ "${BUILD_X64:-0}" = "1" ]; then
         -std=c11 -O2 -Wall -Wextra -Werror -Wno-format-truncation \
         -municode -mwindows \
         "$src/SwitchPowerTray.c" \
-        -luser32 -lshell32 -ladvapi32 -lgdi32 \
+        -luser32 -lshell32 -ladvapi32 -lgdi32 -lole32 -loleaut32 -luuid \
         -o "$out/SwitchPowerTray-x64.exe"
     "$mingw_bin/x86_64-w64-mingw32-clang" \
         -std=c11 -O2 -Wall -Wextra -Werror -Wno-format-truncation -municode \
-        "$src/tests/contracts.c" -luser32 -lshell32 -ladvapi32 -lgdi32 \
+        "$src/tests/contracts.c" -luser32 -lshell32 -ladvapi32 -lgdi32 -lole32 -loleaut32 -luuid \
         -o "$out/SwitchPowerTray-contracts-x64.exe"
 fi
 
 cp "$src/Install-SwitchPowerTray.cmd" "$out/Install-SwitchPowerTray.cmd"
 cp "$src/Restore-SwitchPowerTray.cmd" "$out/Restore-SwitchPowerTray.cmd"
+cp "$src/../Shared/Install-StartupTask.ps1" "$out/Install-StartupTask.ps1"

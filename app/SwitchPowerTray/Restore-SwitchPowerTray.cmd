@@ -24,6 +24,6 @@ if /I not "%HERE:~0,-1%"=="%DEST%" (
     if exist "%DEST%" rmdir /S /Q "%DEST%" 2>nul
 )
 
-echo Restored cursors and removed login autostart. Drivers accepted Windows baseline Mode 7 and Charging Limit Off.
+echo Restored cursors and disabled login autostart. Drivers accepted Handheld and Charging Limit Off.
 echo GPU clock transition is asynchronous; verify actual clock readback before declaring hardware restoration complete.
 exit /b 0

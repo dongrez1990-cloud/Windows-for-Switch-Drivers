@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <wchar.h>
+#include "../Shared/ScheduledStartup.h"
 
 #include "../../drivers/SwitchFan/src/power_ioctl.h"
 #include "../../drivers/SwitchBattery/src/charge_limit_ioctl.h"
@@ -112,6 +113,7 @@ typedef struct _TRAY_STATE {
 
 static TRAY_STATE g_app;
 static UINT g_taskbarCreated;
+static BOOL g_startupHandheldPending;
 
 /* --------------------------------------------------------- Registry helpers */
 
@@ -146,6 +148,9 @@ static LSTATUS WriteRegDword(LPCWSTR subKey, LPCWSTR name, DWORD value)
 
 static BOOL IsAutostartEnabledEx(LPCWSTR valueName)
 {
+    BOOL enabled = FALSE;
+    HRESULT hr = SwitchStartupTask(valueName, FALSE, &enabled);
+    if (hr != S_FALSE) return SUCCEEDED(hr) && enabled;
     HKEY key = NULL;
     DWORD type = 0;
     DWORD size = 0;
@@ -163,9 +168,11 @@ static BOOL IsAutostartEnabledEx(LPCWSTR valueName)
 
 static LSTATUS SetAutostartEnabledEx(LPCWSTR valueName, BOOL enable)
 {
+    HRESULT hr = SwitchStartupTask(valueName, TRUE, &enable);
+    if (hr != S_FALSE) return SUCCEEDED(hr) ? ERROR_SUCCESS : (LSTATUS)hr;
     HKEY key = NULL;
     WCHAR exePath[MAX_PATH];
-    WCHAR cmdLine[MAX_PATH + 32];
+    WCHAR cmdLine[MAX_PATH + 64];
     LSTATUS st;
 
     if (!GetModuleFileNameW(NULL, exePath, MAX_PATH)) {
@@ -177,7 +184,7 @@ static LSTATUS SetAutostartEnabledEx(LPCWSTR valueName, BOOL enable)
         return st;
     }
     if (enable) {
-        _snwprintf(cmdLine, sizeof(cmdLine) / sizeof(cmdLine[0]), L"\"%s\" --minimized", exePath);
+        _snwprintf(cmdLine, sizeof(cmdLine) / sizeof(cmdLine[0]), L"\"%s\" --startup-handheld --minimized", exePath);
         cmdLine[(sizeof(cmdLine) / sizeof(cmdLine[0])) - 1] = L'\0';
         st = RegSetValueExW(key, valueName, 0, REG_SZ,
                             (const BYTE *)cmdLine,
@@ -447,17 +454,16 @@ static void RefreshDriverStatuses(void)
 
 static LPCWSTR PowerModeMenuLabel(UINT mode)
 {
-    static const WCHAR *labels[SwFanPowerModeCount] = {
+    static const WCHAR *labels[SwFanPowerModeDefaultFixed] = {
         L"0: Console — CPU 1963.5 / GPU 844.8 MHz",
         L"1: Handheld — CPU 1581 / GPU 537.6 MHz",
         L"2: OC_CPU — CPU SLT最高频点 / GPU 844.8 MHz",
         L"3: OC_GPU — CPU 1963.5 / GPU HighOPT最高频点",
         L"4: OC_All — CPU/GPU 可用最高频点",
         L"5: Perf_All — CPU最低1224 / GPU最低460.8 MHz",
-        L"6: Perf_OC_All — 性能最低频率 + OC上限",
-        L"Windows 恢复基线 — CPU 1497.6 / GPU 460.8 MHz"
+        L"6: Perf_OC_All — 性能最低频率 + OC上限"
     };
-    return mode < SwFanPowerModeCount ? labels[mode] : L"Unknown Power Mode";
+    return mode < SwFanPowerModeDefaultFixed ? labels[mode] : L"Unavailable Power Mode";
 }
 
 static void FormatChargeBandLabel(UINT limitCenter, WCHAR *buf, size_t cch)
@@ -830,14 +836,10 @@ static void ShowTrayMenu(HWND hwnd)
     AppendMenuW(root, MF_SEPARATOR, 0, NULL);
 
     /* Power Mode submenu */
-    for (UINT m = 0; m < SwFanPowerModeCount; ++m) {
+    for (UINT m = 0; m < SwFanPowerModeDefaultFixed; ++m) {
         UINT flags = MF_STRING;
-        if (m == SwFanPowerModeDefaultFixed) {
-            AppendMenuW(powerMenu, MF_SEPARATOR, 0, NULL);
-        }
         if (!g_app.HavePower || !g_app.Power.IsLite ||
-            (m != SwFanPowerModeDefaultFixed &&
-             (!(g_app.Power.Flags & SWFAN_POWER_FLAG_LIVE_GPU_COUNTER) || !g_app.Power.CpuDfllAvailable))) {
+            !(g_app.Power.Flags & SWFAN_POWER_FLAG_LIVE_GPU_COUNTER) || !g_app.Power.CpuDfllAvailable) {
             flags |= MF_DISABLED | MF_GRAYED;
         } else if (g_app.Power.PowerMode == m) {
             flags |= MF_CHECKED;
@@ -872,7 +874,7 @@ static void ShowTrayMenu(HWND hwnd)
 
     AppendMenuW(root, MF_SEPARATOR, 0, NULL);
     AppendMenuW(root, MF_STRING, IDM_DETAILS, L"Hardware Status & Platform Notes...");
-    AppendMenuW(root, MF_STRING, IDM_RESET_DEFAULTS, L"Reset to Defaults (Mode 0 + Limit Off)");
+    AppendMenuW(root, MF_STRING, IDM_RESET_DEFAULTS, L"Reset to Defaults (Handheld + Limit Off)");
     AppendMenuW(root, MF_STRING, IDM_EXIT, L"Exit");
 
     if (!GetCursorPos(&pt)) {
@@ -894,7 +896,7 @@ static void ShowTrayMenu(HWND hwnd)
 static DWORD ResetAllToDefaults(HWND hwnd, BOOL quiet)
 {
     ULONG zero = 0;
-    SWFAN_POWER_REQUEST baseline = {SWFAN_POWER_STATUS_VERSION, SwFanPowerModeDefaultFixed};
+    SWFAN_POWER_REQUEST baseline = {SWFAN_POWER_STATUS_VERSION, SwFanPowerModeHandheld};
     DWORD err1 = 0, err2 = 0;
     BOOL ok1, ok2, cursorsOk;
 
@@ -905,7 +907,7 @@ static DWORD ResetAllToDefaults(HWND hwnd, BOOL quiet)
                           &zero, sizeof(zero), NULL, 0, &err2);
     RefreshDriverStatuses();
     UpdateTrayVisuals();
-    if (ok1 && (!g_app.HavePower || g_app.Power.PowerMode != SwFanPowerModeDefaultFixed)) {
+    if (ok1 && (!g_app.HavePower || g_app.Power.PowerMode != SwFanPowerModeHandheld)) {
         ok1 = FALSE;
         err1 = g_app.PowerError ? g_app.PowerError : ERROR_INVALID_DATA;
     }
@@ -919,7 +921,7 @@ static DWORD ResetAllToDefaults(HWND hwnd, BOOL quiet)
         FormatWin32Error(err1, e1, sizeof(e1) / sizeof(e1[0]));
         FormatWin32Error(err2, e2, sizeof(e2) / sizeof(e2[0]));
         _snwprintf(msg, sizeof(msg) / sizeof(msg[0]),
-                   L"Reset failed or incomplete:\n  Windows baseline: %s\n  Charging Limit Off: %s\n  Cursors: %s",
+                   L"Reset failed or incomplete:\n  Handheld: %s\n  Charging Limit Off: %s\n  Cursors: %s",
                    ok1 ? L"OK" : e1, ok2 ? L"OK" : e2, cursorsOk ? L"OK" : L"Restore failed");
         msg[(sizeof(msg) / sizeof(msg[0])) - 1] = L'\0';
         MessageBoxW(hwnd, msg, APP_NAME, MB_OK | MB_ICONWARNING);
@@ -930,6 +932,18 @@ static DWORD ResetAllToDefaults(HWND hwnd, BOOL quiet)
 }
 
 /* ------------------------------------------------------------ Window Proc */
+
+static void ApplyStartupHandheld(HWND hwnd)
+{
+    /* The GPU provider becomes live after the login display-driver activation.
+     * Reuse the existing status timer until ready, then issue at most one mode
+     * request. A manual mode choice cancels this pending boot default. */
+    if (!g_startupHandheldPending || !g_app.HavePower || !g_app.Power.IsLite ||
+        !g_app.Power.CpuDfllAvailable || !(g_app.Power.Flags & SWFAN_POWER_FLAG_LIVE_GPU_COUNTER)) return;
+    g_startupHandheldPending = FALSE;
+    if (g_app.Power.PowerMode != SwFanPowerModeHandheld)
+        ApplyPowerModeAction(hwnd, SwFanPowerModeHandheld);
+}
 
 static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -942,6 +956,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     switch (msg) {
     case WM_CREATE:
         RefreshDriverStatuses();
+        ApplyStartupHandheld(hwnd);
         memset(&g_app.Nid, 0, sizeof(g_app.Nid));
         g_app.Nid.cbSize = sizeof(g_app.Nid);
         g_app.Nid.hWnd = hwnd;
@@ -959,6 +974,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             PollCursorIdle(hwnd);
         } else if (wParam == TIMER_ID_STATUS) {
             RefreshDriverStatuses();
+            ApplyStartupHandheld(hwnd);
             UpdateTrayVisuals();
         }
         return 0;
@@ -967,14 +983,13 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         if (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_LBUTTONUP ||
             LOWORD(lParam) == WM_CONTEXTMENU) {
             ShowTrayMenu(hwnd);
-        } else if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
-            ShowDetailsDialog(hwnd);
         }
         return 0;
 
     case WM_COMMAND: {
         UINT id = LOWORD(wParam);
-        if (id >= IDM_POWER_BASE && id < IDM_POWER_BASE + SwFanPowerModeCount) {
+        if (id >= IDM_POWER_BASE && id < IDM_POWER_BASE + SwFanPowerModeDefaultFixed) {
+            g_startupHandheldPending = FALSE;
             ApplyPowerModeAction(hwnd, id - IDM_POWER_BASE);
             return 0;
         }
@@ -1016,6 +1031,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             ShowDetailsDialog(hwnd);
             return 0;
         case IDM_RESET_DEFAULTS:
+            g_startupHandheldPending = FALSE;
             ResetAllToDefaults(hwnd, FALSE);
             return 0;
         case IDM_EXIT:
@@ -1167,6 +1183,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLin
     (void)nCmdShow;
 
     if (lpCmdLine != NULL) {
+        if (wcsstr(lpCmdLine, L"--exit") != NULL) {
+            StopRunningTrayInstance();
+            return 0;
+        }
+        g_startupHandheldPending = wcsstr(lpCmdLine, L"--startup-handheld") != NULL;
         if (wcsstr(lpCmdLine, L"--self-test") != NULL) {
             return RunSelfTest();
         }

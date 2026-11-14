@@ -18,9 +18,9 @@ mkdir "%DEST%" 2>nul
 copy /Y "%SRC%SwitchPowerTray.exe" "%DEST%\SwitchPowerTray.exe" >nul || exit /b 1
 copy /Y "%SRC%Restore-SwitchPowerTray.cmd" "%DEST%\Restore-SwitchPowerTray.cmd" >nul || exit /b 1
 
-"%DEST%\SwitchPowerTray.exe" --install-autostart || exit /b 1
-start "" "%DEST%\SwitchPowerTray.exe" --minimized
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SRC%Install-StartupTask.ps1" -App SwitchPowerTray -Executable "%DEST%\SwitchPowerTray.exe" || exit /b 1
+start "" "%DEST%\SwitchPowerTray.exe" --startup-handheld --minimized
 
 echo Installed SwitchPowerTray to "%DEST%" and enabled Start at Login.
-echo Default platform clocks remain unchanged (CPU 1497.6 MHz, GPU 460.8 MHz, RAM 1600 MHz, Charging Limit Off).
+echo Login defaults to Handheld once the GPU driver is ready. Charging limit is preserved.
 exit /b 0

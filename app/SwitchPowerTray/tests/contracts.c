@@ -89,6 +89,23 @@ int wmain(void)
     assert(ResetAllToDefaults(NULL, TRUE) == ERROR_NOT_READY);
     assert(RunUninstallOrRestore(FALSE, TRUE) == ERROR_NOT_READY);
 
+    /* Login can precede KMD activation. Do not consume the one-shot default
+     * until the provider is ready, nor overwrite a manually chosen mode later. */
+    g_startupHandheldPending = TRUE;
+    g_app.HavePower = FALSE;
+    ApplyStartupHandheld(NULL);
+    assert(g_startupHandheldPending);
+    g_app.HavePower = TRUE;
+    g_app.Power.IsLite = g_app.Power.CpuDfllAvailable = 1;
+    g_app.Power.Flags = 0;
+    ApplyStartupHandheld(NULL);
+    assert(g_startupHandheldPending);
+    g_app.Power.Flags = SWFAN_POWER_FLAG_LIVE_GPU_COUNTER;
+    g_app.Power.PowerMode = SwFanPowerModeHandheld;
+    ApplyStartupHandheld(NULL);
+    assert(!g_startupHandheldPending);
+    g_app.HavePower = FALSE;
+
     /* Recreate the notification icon after Explorer broadcasts TaskbarCreated. */
     g_taskbarCreated = WM_APP + 73;
     g_app.Nid.cbSize = sizeof(g_app.Nid);
