@@ -145,14 +145,35 @@ static BOOLEAN SwFanDfllAcquireClocks(PSWFAN_DEVICE d, ULONG *i2c_khz)
     SwFanTrace(L"DfllSavedReset", f->SavedReset);
     SwFanTrace(L"DfllSavedBankReset", f->SavedBankReset);
     SwFanTrace(L"DfllSavedGate", f->SavedGate);
-    /* Do not take over an oscillator/output already owned by another agent. */
-    if ((f->SavedGate & SW_DFLL_GATE_BIT) && !(f->SavedBankReset & SW_DFLL_GATE_BIT) &&
-        ((SwDfllReadMap(d, SwDfllMmio, SW_DFLL_CTRL) & 3u) ||
-         (SwDfllReadMap(d, SwDfllMmio, SW_DFLL_OUTPUT_CFG) & SW_DFLL_I2C_ENABLE))) {
-        SwFanTrace(L"DfllAcquireStage", 2u);
-        SwFanTrace(L"DfllExistingControl", SwDfllReadMap(d, SwDfllMmio, SW_DFLL_CTRL));
-        SwFanTrace(L"DfllExistingOutput", SwDfllReadMap(d, SwDfllMmio, SW_DFLL_OUTPUT_CFG));
-        return FALSE;
+    if ((f->SavedGate & SW_DFLL_GATE_BIT) && !(f->SavedBankReset & SW_DFLL_GATE_BIT)) {
+        ULONG control = SwDfllReadMap(d, SwDfllMmio, SW_DFLL_CTRL);
+        ULONG output = SwDfllReadMap(d, SwDfllMmio, SW_DFLL_OUTPUT_CFG);
+        ULONG force = SwDfllReadMap(d, SwDfllMmio, SW_DFLL_FORCE);
+        SwFanTrace(L"DfllExistingControl", control);
+        SwFanTrace(L"DfllExistingOutput", output);
+        SwFanTrace(L"DfllExistingForce", force);
+        /* WinX leaves CTRL disabled and DVCO reset, but OUTPUT_CFG retains
+         * I2C_ENABLE. That bit alone is not a running controller. Never take
+         * over an active loop or forced voltage output. CPU is still PLLX. */
+        if ((control & 3u) || (force & 0x40u) ||
+            ((output & SW_DFLL_I2C_ENABLE) && !(f->SavedReset & 1u))) {
+            SwFanTrace(L"DfllAcquireStage", 2u); return FALSE;
+        }
+        if (output & SW_DFLL_I2C_ENABLE) {
+            BOOLEAN idle = FALSE;
+            SwDfllWriteMap(d, SwDfllMmio, SW_DFLL_OUTPUT_CFG, output & ~SW_DFLL_I2C_ENABLE);
+            if (!(SwDfllReadMap(d, SwDfllMmio, SW_DFLL_OUTPUT_CFG) & SW_DFLL_I2C_ENABLE)) {
+                /* Same two-read/2us minimum as Switchroot's pending check. */
+                for (ULONG i = 0; i < 100u; ++i) {
+                    ULONG pending = SwDfllReadMap(d, SwDfllMmio, SW_DFLL_I2C_STS);
+                    KeStallExecutionProcessor(10u);
+                    if (!(pending & 1u) && !(SwDfllReadMap(d, SwDfllMmio, SW_DFLL_I2C_STS) & 1u)) {
+                        idle = TRUE; break;
+                    }
+                }
+            }
+            if (!idle) { SwFanTrace(L"DfllAcquireStage", 5u); return FALSE; }
+        }
     }
     f->ClocksOwned = TRUE;
     /* Reset before ungating: stale I2C state must never issue an M4 write. */

@@ -175,3 +175,21 @@ The Fan16 adapter fails the fixed-PLLP fixture with unused M/N=0; the corrected
 adapter passes under ASan/UBSan along with the software-override/DIVP and
 CLK_M/PLLP I2C cases and existing PMIC recovery controls. These are models;
 native switching remains pending.
+
+
+## Fan19: claim only the disabled, reset DFLL handoff
+
+Fan18 located mode1 refusal at the ownership guard (stage2). Native values:
+CTRL=0, OUTPUT_CFG=0x50200000, DVCO_RESET=1, RESET_W=0x110037ff,
+CLK_ENB_W=0x482880fc, while CPU remained PLLX1497600kHz/1120mV.
+The I2C master-enable bit alone was incorrectly treated as an active owner.
+Fan19 accepts that disabled/reset case only when forced output is also off.
+It inhibits new I2C messages and requires two clear pending reads separated
+by at least the upstream 2us minimum before resetting the idle controller.
+An active loop, forced voltage output, failed disable or undrained request
+still prevents takeover. CPU mux and voltage are unchanged on rejection.
+
+Reference: pinned Switchroot clk-dfll.c dfll_i2c_set_output_enabled and
+is_output_i2c_req_pending. The captured-idle fixture fails with Fan18 and
+passes with Fan19 under ASan/UBSan; active-owner/pending-request rejection
+and exact saved gate/reset restoration are checked. Native acceptance pending.

@@ -424,6 +424,23 @@ int main(void)
     assert(SwFanDfllAvailable(&d));
     assert(LiteDfllClockMKhz(5u << 28, 1u << 2) == 19200u);
     assert(LiteDfllClockMKhz(4u << 28, 1u << 2) == 0u);
+    /* Captured WinX idle handoff: gate on, module out of reset, DVCO in
+     * reset, CTRL disabled, but the I2C master-enable bit is retained. */
+    bank[0] = 0x110037ffu; bank[2] = 0x482880fcu; reset_dvco = 1u;
+    dfll_regs[SW_DFLL_OUTPUT_CFG / 4] = 0x50200000u;
+    dfll_regs[SW_DFLL_FORCE / 4] = 0x40u;
+    assert(SwFanSetPowerMode(&d, 1) == STATUS_DEVICE_NOT_READY);
+    assert(dfll_regs[SW_DFLL_OUTPUT_CFG / 4] == 0x50200000u);
+    dfll_regs[SW_DFLL_FORCE / 4] = 0u;
+    dfll_regs[SW_DFLL_CTRL / 4] = 2u;
+    assert(SwFanSetPowerMode(&d, 1) == STATUS_DEVICE_NOT_READY);
+    dfll_regs[SW_DFLL_CTRL / 4] = 0u;
+    dfll_regs[SW_DFLL_I2C_STS / 4] = 1u;
+    assert(SwFanSetPowerMode(&d, 1) == STATUS_DEVICE_NOT_READY);
+    assert(!d.Dfll.ClocksOwned && reset_dvco == 1u && bank[0] == 0x110037ffu);
+    assert(SwCpuKhz(&d) == 1497600u && pmic_regs[0x26] == 174u);
+    dfll_regs[SW_DFLL_I2C_STS / 4] = 0u;
+    dfll_regs[SW_DFLL_OUTPUT_CFG / 4] = 0x50200000u;
     assert(SwFanSetPowerMode(&d, 1) == STATUS_SUCCESS);
     assert(dfll_regs[SW_DFLL_I2C_DIV / 4] == 0x00050001u);
     assert(i2c_source == (6u << 29)); /* shared I2C5 parent was not changed */
@@ -447,7 +464,8 @@ int main(void)
     }
     assert(SwFanSetPowerMode(&d,7) == STATUS_SUCCESS);
     assert(!d.Dfll.Control.active && SwCpuKhz(&d)==1497600u && pmic_regs[0x26]==174);
-    assert(!d.Dfll.ClocksOwned && !bank[2]);
+    assert(!d.Dfll.ClocksOwned && bank[2] == 0x482880fcu &&
+           bank[0] == 0x110037ffu && reset_dvco == 1u);
 
     /* A missing/unknown handoff cannot silently turn on the new clock path. */
     d.Dfll.Handoff.CpuSpeedo=0;
