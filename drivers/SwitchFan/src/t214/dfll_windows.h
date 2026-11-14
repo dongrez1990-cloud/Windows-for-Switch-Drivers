@@ -141,10 +141,19 @@ static BOOLEAN SwFanDfllAcquireClocks(PSWFAN_DEVICE d, ULONG *i2c_khz)
     f->SavedReset = SwDfllReadMap(d, SwDfllReset, 0);
     f->SavedBankReset = SwDfllReadMap(d, SwDfllBankStatus, 0);
     f->SavedGate = SwDfllReadMap(d, SwDfllBankStatus, 8);
+    SwFanTrace(L"DfllAcquireStage", 1u);
+    SwFanTrace(L"DfllSavedReset", f->SavedReset);
+    SwFanTrace(L"DfllSavedBankReset", f->SavedBankReset);
+    SwFanTrace(L"DfllSavedGate", f->SavedGate);
     /* Do not take over an oscillator/output already owned by another agent. */
     if ((f->SavedGate & SW_DFLL_GATE_BIT) && !(f->SavedBankReset & SW_DFLL_GATE_BIT) &&
         ((SwDfllReadMap(d, SwDfllMmio, SW_DFLL_CTRL) & 3u) ||
-         (SwDfllReadMap(d, SwDfllMmio, SW_DFLL_OUTPUT_CFG) & SW_DFLL_I2C_ENABLE))) return FALSE;
+         (SwDfllReadMap(d, SwDfllMmio, SW_DFLL_OUTPUT_CFG) & SW_DFLL_I2C_ENABLE))) {
+        SwFanTrace(L"DfllAcquireStage", 2u);
+        SwFanTrace(L"DfllExistingControl", SwDfllReadMap(d, SwDfllMmio, SW_DFLL_CTRL));
+        SwFanTrace(L"DfllExistingOutput", SwDfllReadMap(d, SwDfllMmio, SW_DFLL_OUTPUT_CFG));
+        return FALSE;
+    }
     f->ClocksOwned = TRUE;
     /* Reset before ungating: stale I2C state must never issue an M4 write. */
     SwDfllWriteMap(d, SwDfllBankReset, 0, SW_DFLL_GATE_BIT);
@@ -161,8 +170,15 @@ static BOOLEAN SwFanDfllAcquireClocks(PSWFAN_DEVICE d, ULONG *i2c_khz)
         !(SwDfllReadMap(d, SwDfllBankStatus, 8) & SW_DFLL_GATE_BIT) ||
         (SwDfllReadMap(d, SwDfllBankStatus, 0) & SW_DFLL_GATE_BIT) ||
         (SwDfllReadMap(d, SwDfllReset, 0) & 1u)) {
+        SwFanTrace(L"DfllAcquireStage", 3u);
+        SwFanTrace(L"DfllRefReadback", SwDfllReadMap(d, SwDfllSources, 0));
+        SwFanTrace(L"DfllSocReadback", SwDfllReadMap(d, SwDfllSources, 4));
+        SwFanTrace(L"DfllGateReadback", SwDfllReadMap(d, SwDfllBankStatus, 8));
+        SwFanTrace(L"DfllBankResetReadback", SwDfllReadMap(d, SwDfllBankStatus, 0));
+        SwFanTrace(L"DfllDvcoResetReadback", SwDfllReadMap(d, SwDfllReset, 0));
         (void)SwFanDfllReleaseClocks(d); return FALSE;
     }
+    SwFanTrace(L"DfllAcquireStage", 4u);
     return TRUE;
 }
 
