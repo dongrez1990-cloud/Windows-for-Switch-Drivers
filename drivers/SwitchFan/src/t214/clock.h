@@ -23,6 +23,11 @@ static VOID SwFanPmicLock(PSWFAN_DEVICE Dev) { (VOID)Dev; }
 static VOID SwFanPmicUnlock(PSWFAN_DEVICE Dev) { (VOID)Dev; }
 #endif
 
+#ifndef SWFAN_HAVE_CPU_LOCK
+static VOID SwFanCpuLock(PSWFAN_DEVICE Dev) { (VOID)Dev; }
+static VOID SwFanCpuUnlock(PSWFAN_DEVICE Dev) { (VOID)Dev; }
+#endif
+
 static ULONG SwCpuRead(PSWFAN_DEVICE Dev, ULONG Offset)
 {
     return READ_REGISTER_ULONG((PULONG)(Dev->Car + Offset));
@@ -39,6 +44,9 @@ static ULONG SwCpuKhz(PSWFAN_DEVICE Dev)
     ULONG Base, M, N, P, Policy;
     if (Dev->Car == NULL) return 0;
     Policy = SwCpuRead(Dev, CPU_CCLK_POLICY);
+#ifdef SWFAN_HAVE_DFLL
+    if (Policy == 0x2000ffffu) return SwFanDfllReadKhz(Dev);
+#endif
     if (Policy == CPU_ON_CLKM) return 19200;
     if (Policy != CPU_ON_PLLX) return 0;
     Base = SwCpuRead(Dev, CPU_PLLX_BASE);
@@ -106,9 +114,16 @@ static NTSTATUS SwCpuRelock(PSWFAN_DEVICE Dev, ULONG Dividers)
     return Locked ? STATUS_SUCCESS : STATUS_IO_TIMEOUT;
 }
 
-static NTSTATUS SwCpuApply(PSWFAN_DEVICE Dev, BOOLEAN Overclock)
+/* Caller holds CpuLock across the complete voltage/PLL/state transaction. */
+static NTSTATUS SwCpuApplyLocked(PSWFAN_DEVICE Dev, BOOLEAN Overclock)
 {
     NTSTATUS Status;
+#ifdef SWFAN_HAVE_DFLL
+    if (Dev->Dfll.ClocksOwned || Dev->Dfll.Control.prepared || Dev->Dfll.Control.active) {
+        Status = SwFanDfllStopLocked(Dev);
+        if (!NT_SUCCESS(Status)) return Status;
+    }
+#endif
     if (!Dev->CpuConfigured || Dev->CpuApplied == Overclock) return STATUS_SUCCESS;
     if (Dev->Car == NULL || Dev->Pmic == NULL) return STATUS_DEVICE_NOT_READY;
     if (Overclock) {
@@ -128,6 +143,15 @@ static NTSTATUS SwCpuApply(PSWFAN_DEVICE Dev, BOOLEAN Overclock)
     }
     SwFanTrace(L"CpuActualKhz", SwCpuKhz(Dev));
     SwFanTrace(L"CpuOverclockActive", Dev->CpuApplied);
+    return Status;
+}
+
+static NTSTATUS SwCpuApply(PSWFAN_DEVICE Dev, BOOLEAN Overclock)
+{
+    NTSTATUS Status;
+    SwFanCpuLock(Dev);
+    Status = SwCpuApplyLocked(Dev, Overclock);
+    SwFanCpuUnlock(Dev);
     return Status;
 }
 
@@ -167,11 +191,20 @@ static VOID SwCpuPrepare(WDFDEVICE Device)
 static VOID SwCpuTemperature(PSWFAN_DEVICE Dev, ULONG Temp, BOOLEAN Valid)
 {
     NTSTATUS Status;
-    if (!Dev->CpuConfigured) return;
+    SwFanCpuLock(Dev);
+    if (!Dev->CpuConfigured) { SwFanCpuUnlock(Dev); return; }
+#ifdef SWFAN_HAVE_DFLL
+    if (Dev->PowerMode < SwNvpCount || Dev->Dfll.FaultLatched) {
+        (VOID)SwFanDvfsUpdateLocked(Dev, Temp, Valid);
+        SwFanCpuUnlock(Dev);
+        return;
+    }
+#endif
     if (!Valid || Temp >= 80) Dev->CpuThrottled = TRUE;
     else if (Temp <= 70) Dev->CpuThrottled = FALSE;
-    Status = SwCpuApply(Dev, Dev->CpuOverclockEnabled && !Dev->CpuThrottled);
+    Status = SwCpuApplyLocked(Dev, Dev->CpuOverclockEnabled && !Dev->CpuThrottled);
     SwFanTrace(L"CpuLastError", (ULONG)Status);
     SwFanTrace(L"CpuThrottled", Dev->CpuThrottled);
     SwFanTrace(L"CpuActualKhz", SwCpuKhz(Dev));
+    SwFanCpuUnlock(Dev);
 }

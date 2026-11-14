@@ -10,6 +10,7 @@ if not exist "%SRC%SwitchPowerTray.exe" (
 
 if exist "%DEST%\SwitchPowerTray.exe" (
     "%DEST%\SwitchPowerTray.exe" --restore-cursors
+    if errorlevel 1 exit /b 1
     taskkill /IM SwitchPowerTray.exe /F >nul 2>nul
 )
 

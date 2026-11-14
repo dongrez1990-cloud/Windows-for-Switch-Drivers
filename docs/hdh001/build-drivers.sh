@@ -7,6 +7,7 @@ out=${2:?output directory}
 : "${WDK_LIB:?WDK Lib/version/km/ARM64}"
 : "${WDF_INCLUDE:?WDK Include/wdf/kmdf/1.15}"
 : "${WDF_LIB:?WDK Lib/wdf/kmdf/ARM64/1.15}"
+sdk=${SDK_INCLUDE:-$WDK_INCLUDE}
 extra=${WDK_EXTRA_LIB:-$WDK_LIB}
 cc=${CLANG_CL:-clang-cl}; ld=${LLD_LINK:-lld-link}
 for pair in Tegra210Gpio:tegra210gpio Tegra210I2c:tegra210i2c SwitchLiteTouch:switchtouch SwitchPowerButton:switchpwrbtn SwitchFan:switchfan SwitchBattery:switchbattery SwitchRtc:switchrtc SwitchBluetooth:switchbt SwitchSensor:switchsio TegraXusb:tegraxusb; do
@@ -23,7 +24,7 @@ for pair in Tegra210Gpio:tegra210gpio Tegra210I2c:tegra210i2c SwitchLiteTouch:sw
             -Wno-nonportable-include-path /D_ARM64_ /DARM64 /D_WIN64 /DNTDDI_VERSION=0x0A000008 \
             /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 /DKMDF_VERSION_MAJOR=1 /DKMDF_VERSION_MINOR=15 \
             /DPOOL_NX_OPTIN=1 /DSWITCH_LITE_TOUCH=1 $extra_defs "/imsvc$WDK_INCLUDE/km/crt" "/imsvc$WDK_INCLUDE/km" \
-            "/imsvc$WDK_INCLUDE/shared" "/imsvc$WDK_INCLUDE/km/spb/1.0" "/imsvc$WDF_INCLUDE" \
+            "/imsvc$WDK_INCLUDE/shared" "/imsvc$sdk/shared" "/imsvc$sdk/ucrt" "/imsvc$WDK_INCLUDE/km/spb/1.0" "/imsvc$WDF_INCLUDE" \
             "/Fo$dest/$obj" -- "$file"
     done
     case "$dir" in

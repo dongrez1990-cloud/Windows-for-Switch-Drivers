@@ -63,6 +63,9 @@ static PSWFAN_DEVICE SwFanGetDevice(void *d){return d;}
 static PSWFAN_DEVICE SwFanGetTimer(void *d){return d;}
 static ULONG temp=32,sleep_off; static bool sensor_fail,clock_fail;
 static POWER_ACTION action; static char order[64];static unsigned next;
+static bool cpu_locked;
+static void SwFanCpuLock(PSWFAN_DEVICE d){(void)d;assert(!cpu_locked);cpu_locked=true;}
+static void SwFanCpuUnlock(PSWFAN_DEVICE d){(void)d;assert(cpu_locked);cpu_locked=false;}
 static bool backlight_locked;static unsigned registry_writes;
 static void event(char c){assert(next<sizeof(order));order[next++]=c;}
 static void SwFanTrace(const wchar_t *n,ULONG v){assert(!backlight_locked);registry_writes++;if(!wcscmp(n,L"SleepFanOff"))sleep_off=v;}

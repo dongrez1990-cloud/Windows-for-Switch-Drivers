@@ -35,9 +35,13 @@
 #define APP_NAME            L"Switch Power & Battery"
 #define WND_CLASS_NAME      L"SwitchWOAPowerTrayWnd"
 #define SINGLE_MUTEX_NAME   L"Local\\SwitchWOA.SwitchPowerTray"
+#ifndef REG_SETTINGS_KEY
 #define REG_SETTINGS_KEY    L"Software\\SwitchWOA\\SwitchPowerTray"
+#endif
 #define REG_RUN_KEY         L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#ifndef REG_RUN_VALUE
 #define REG_RUN_VALUE       L"SwitchPowerTray"
+#endif
 #define REG_RUN_TEST_VALUE  L"SwitchPowerTray_SelfTest"
 #define REG_AUTOHIDE_VALUE  L"AutoHideCursor"
 #define REG_HIDDEN_VALUE    L"CursorHidden"
@@ -54,7 +58,7 @@
 #define STATUS_POLL_MS          3000U
 
 enum MenuCommandId {
-    IDM_POWER_BASE      = 1000, /* 1000..1004 */
+    IDM_POWER_BASE      = 1000, /* 1000..1007 */
     IDM_LIMIT_OFF       = 1100,
     IDM_LIMIT_85        = 1101,
     IDM_LIMIT_55        = 1102,
@@ -107,6 +111,7 @@ typedef struct _TRAY_STATE {
 } TRAY_STATE;
 
 static TRAY_STATE g_app;
+static UINT g_taskbarCreated;
 
 /* --------------------------------------------------------- Registry helpers */
 
@@ -219,12 +224,14 @@ static BOOL RestoreSystemCursors(void)
                 g_app.SavedCursors[i] = NULL;
             }
         }
-        if (restored > 0) {
+        if (restored == sizeof(kSystemCursorIds) / sizeof(kSystemCursorIds[0])) {
             ok = TRUE;
         }
     }
-    (void)WriteRegDword(REG_SETTINGS_KEY, REG_HIDDEN_VALUE, 0);
-    g_app.CursorHidden = FALSE;
+    if (ok) {
+        (void)WriteRegDword(REG_SETTINGS_KEY, REG_HIDDEN_VALUE, 0);
+        g_app.CursorHidden = FALSE;
+    }
     return ok;
 }
 
@@ -258,11 +265,20 @@ static BOOL HideSystemCursors(void)
         if (cur != NULL) {
             g_app.SavedCursors[i] = (HCURSOR)CopyIcon((HICON)cur);
         }
+        if (g_app.SavedCursors[i] == NULL) {
+            FreeSavedCursors();
+            DestroyCursor(blank);
+            return FALSE;
+        }
     }
 
     /* Record breadcrumb BEFORE modifying global system cursors so abnormal
      * termination or power loss recovers user cursors on next startup. */
-    (void)WriteRegDword(REG_SETTINGS_KEY, REG_HIDDEN_VALUE, 1);
+    if (WriteRegDword(REG_SETTINGS_KEY, REG_HIDDEN_VALUE, 1) != ERROR_SUCCESS) {
+        FreeSavedCursors();
+        DestroyCursor(blank);
+        return FALSE;
+    }
 
     for (i = 0; i < sizeof(kSystemCursorIds) / sizeof(kSystemCursorIds[0]); ++i) {
         HCURSOR copy = (HCURSOR)CopyIcon((HICON)blank);
@@ -389,6 +405,10 @@ static BOOL SendDeviceIoctl(LPCWSTR devicePath, DWORD ioctlCode,
     return TRUE;
 }
 
+static volatile LONG g_loadEnabled;
+static HANDLE g_loadStop, g_loadThread;
+#include "cpu_load.h"
+
 static void RefreshDriverStatuses(void)
 {
     SWFAN_POWER_STATUS pwr;
@@ -407,6 +427,8 @@ static void RefreshDriverStatuses(void)
         g_app.PowerError = err ? err : ERROR_INVALID_DATA;
     }
 
+    InterlockedExchange(&g_loadEnabled, g_app.HavePower && g_app.Power.CpuDfllActive &&
+                         g_app.Power.PowerMode < SwFanPowerModeDefaultFixed);
     err = 0;
     memset(&bat, 0, sizeof(bat));
     if (SendDeviceIoctl(L"\\\\.\\SwitchBattery", IOCTL_SWBAT_GET_CHARGE_LIMIT,
@@ -425,20 +447,17 @@ static void RefreshDriverStatuses(void)
 
 static LPCWSTR PowerModeMenuLabel(UINT mode)
 {
-    switch (mode) {
-    case SwFanPowerModeDefaultFixed:
-        return L"0: Default Fixed - CPU 1497.6 MHz / GPU 460.8 MHz (Boot Default)";
-    case SwFanPowerModeEcoDynamic:
-        return L"1: Eco Dynamic - CPU ~998.4 MHz / GPU HighOPT <=460.8 MHz";
-    case SwFanPowerModeBalancedDynamic:
-        return L"2: Balanced Dynamic - CPU 1497.6 MHz / GPU HighOPT <=460.8 MHz";
-    case SwFanPowerModeConsoleDynamic:
-        return L"3: Console Dynamic - CPU 1497.6 MHz / GPU HighOPT <=768.0 MHz [Experimental]";
-    case SwFanPowerModeMaxHighOpt:
-        return L"4: Max HighOPT - CPU 1497.6 MHz / GPU HighOPT <=844.8 MHz [Experimental]";
-    default:
-        return L"Unknown Power Mode";
-    }
+    static const WCHAR *labels[SwFanPowerModeCount] = {
+        L"0: Console — CPU 1963.5 / GPU 844.8 MHz",
+        L"1: Handheld — CPU 1581 / GPU 537.6 MHz",
+        L"2: OC_CPU — CPU SLT最高频点 / GPU 844.8 MHz",
+        L"3: OC_GPU — CPU 1963.5 / GPU HighOPT最高频点",
+        L"4: OC_All — CPU/GPU 可用最高频点",
+        L"5: Perf_All — CPU最低1224 / GPU最低460.8 MHz",
+        L"6: Perf_OC_All — 性能最低频率 + OC上限",
+        L"Windows 恢复基线 — CPU 1497.6 / GPU 460.8 MHz"
+    };
+    return mode < SwFanPowerModeCount ? labels[mode] : L"Unknown Power Mode";
 }
 
 static void FormatChargeBandLabel(UINT limitCenter, WCHAR *buf, size_t cch)
@@ -595,10 +614,13 @@ static void UpdateTrayVisuals(void)
     if (g_app.HavePower) {
         switch (g_app.Power.PowerMode) {
         case SwFanPowerModeDefaultFixed:    fill = 0x2EA043u; break; /* green */
-        case SwFanPowerModeEcoDynamic:      fill = 0x1F6FEBu; break; /* blue */
-        case SwFanPowerModeBalancedDynamic: fill = 0x238636u; break; /* emerald */
-        case SwFanPowerModeConsoleDynamic:
-        case SwFanPowerModeMaxHighOpt:      fill = 0xD29922u; break; /* amber */
+        case SwFanPowerModeHandheld:      fill = 0x1F6FEBu; break; /* blue */
+        case SwFanPowerModeConsole: fill = 0x238636u; break; /* emerald */
+        case SwFanPowerModeOcCpu:
+        case SwFanPowerModeOcGpu:
+        case SwFanPowerModeOcAll:
+        case SwFanPowerModePerfAll:
+        case SwFanPowerModePerfOcAll:      fill = 0xD29922u; break; /* amber */
         default:                            fill = 0x6E7681u; break;
         }
     }
@@ -648,8 +670,9 @@ static void UpdateTrayVisuals(void)
     }
     g_app.Nid.szTip[(sizeof(g_app.Nid.szTip) / sizeof(WCHAR)) - 1] = L'\0';
 
-    if (g_app.IconAdded) {
-        Shell_NotifyIconW(NIM_MODIFY, &g_app.Nid);
+    if (g_app.Nid.hWnd != NULL &&
+        (!g_app.IconAdded || !Shell_NotifyIconW(NIM_MODIFY, &g_app.Nid))) {
+        g_app.IconAdded = Shell_NotifyIconW(NIM_ADD, &g_app.Nid);
     }
 }
 
@@ -657,27 +680,17 @@ static void UpdateTrayVisuals(void)
 
 static void ApplyPowerModeAction(HWND hwnd, UINT requestedMode)
 {
-    ULONG modeIn = requestedMode;
+    SWFAN_POWER_REQUEST modeIn = {SWFAN_POWER_STATUS_VERSION, requestedMode};
     DWORD err = 0;
 
     if (!g_app.HavePower || !g_app.Power.IsLite) {
         MessageBoxW(hwnd,
-                    L"SwitchFan v14 Switch Lite power control is not available on this system.\n\n"
-                    L"Install the updated switchfan.sys (1.0.0.14) package first.",
+                    L"SwitchFan DFLL v2 Switch Lite power control is not available on this system.\n\n"
+                    L"Install the updated switchfan.sys and matching DFLL firmware package first.",
                     APP_NAME, MB_OK | MB_ICONERROR);
         return;
     }
 
-    if (requestedMode >= SwFanPowerModeConsoleDynamic) {
-        LPCWSTR warn =
-            L"This Power Mode is experimental on Windows and raises the GPU NAPLL HighOPT ceiling "
-            L"above the 460.8 MHz default.\n\n"
-            L"If display/3D becomes unstable, reboot to return automatically to Mode 0 "
-            L"(CPU 1497.6 MHz / GPU 460.8 MHz).\n\nApply this experimental mode now?";
-        if (MessageBoxW(hwnd, warn, APP_NAME, MB_OKCANCEL | MB_ICONWARNING) != IDOK) {
-            return;
-        }
-    }
 
     if (!SendDeviceIoctl(L"\\\\.\\SwitchBacklight", IOCTL_SWFAN_SET_POWER_MODE,
                          &modeIn, sizeof(modeIn), NULL, 0, &err)) {
@@ -735,7 +748,7 @@ static void ApplyChargeLimitAction(HWND hwnd, UINT requestedLimit)
 
 static void ShowDetailsDialog(HWND hwnd)
 {
-    WCHAR pwrLine[256], batLine[256], details[1400];
+    WCHAR pwrLine[256], batLine[256], details[1800];
 
     RefreshDriverStatuses();
     FormatPowerHeader(&g_app, pwrLine, sizeof(pwrLine) / sizeof(pwrLine[0]));
@@ -747,6 +760,8 @@ static void ShowDetailsDialog(HWND hwnd)
         L"Driver Readback Details:\n"
         L"  PowerMode: %u | CPU Target/Actual: %u / %u kHz (%u mV) | Fan PWM: %u/236\n"
         L"  GPU Policy: mode=%u (%u..%u kHz) | KMD Reported: %u kHz / %u uV (status=0x%08X)\n"
+        L"  CPU cap requested/effective: %u / %u kHz; GPU requested: %u kHz\n"
+        L"  CPU DFLL active=%u, Speedo=%u, process=%u, last error=0x%08X\n"
         L"  BQ24193 REG00=0x%02X (HIZ=%u) REG01=0x%02X REG08=0x%02X | NTSTATUS=0x%08X\n\n"
         L"Platform & Safety Notes:\n"
         L"  1. Charging Limit uses Switch L4T +-5%% SoC hysteresis: nominal 55%% regulates 50-60%%,\n"
@@ -767,6 +782,8 @@ static void ShowDetailsDialog(HWND hwnd)
         g_app.HavePower ? g_app.Power.GpuReportedKhz : 0u,
         g_app.HavePower ? g_app.Power.GpuReportedUv : 0u,
         g_app.HavePower ? g_app.Power.GpuStatusWord : 0u,
+        g_app.Power.CpuRequestedMaxKhz, g_app.Power.CpuPolicyMaxKhz, g_app.Power.GpuRequestedMaxKhz,
+        g_app.Power.CpuDfllActive, g_app.Power.CpuSpeedo, g_app.Power.CpuProcessId, g_app.Power.CpuLastError,
         g_app.HaveBattery ? g_app.Battery.Reg00InputSrc : 0u,
         (g_app.HaveBattery && (g_app.Battery.Flags & SWBAT_CHARGE_FLAG_HIZ_ACTIVE)) ? 1u : 0u,
         g_app.HaveBattery ? g_app.Battery.Reg01PwrOn : 0u,
@@ -806,10 +823,12 @@ static void ShowTrayMenu(HWND hwnd)
     /* Power Mode submenu */
     for (UINT m = 0; m < SwFanPowerModeCount; ++m) {
         UINT flags = MF_STRING;
-        if (m == SwFanPowerModeConsoleDynamic) {
+        if (m == SwFanPowerModeDefaultFixed) {
             AppendMenuW(powerMenu, MF_SEPARATOR, 0, NULL);
         }
-        if (!g_app.HavePower || !g_app.Power.IsLite) {
+        if (!g_app.HavePower || !g_app.Power.IsLite ||
+            (m != SwFanPowerModeDefaultFixed &&
+             (!(g_app.Power.Flags & SWFAN_POWER_FLAG_LIVE_GPU_COUNTER) || !g_app.Power.CpuDfllAvailable))) {
             flags |= MF_DISABLED | MF_GRAYED;
         } else if (g_app.Power.PowerMode == m) {
             flags |= MF_CHECKED;
@@ -863,36 +882,54 @@ static void ShowTrayMenu(HWND hwnd)
     DestroyMenu(root);
 }
 
-static void ResetAllToDefaults(HWND hwnd, BOOL quiet)
+static DWORD ResetAllToDefaults(HWND hwnd, BOOL quiet)
 {
     ULONG zero = 0;
+    SWFAN_POWER_REQUEST baseline = {SWFAN_POWER_STATUS_VERSION, SwFanPowerModeDefaultFixed};
     DWORD err1 = 0, err2 = 0;
-    BOOL ok1, ok2;
+    BOOL ok1, ok2, cursorsOk;
 
-    (void)RestoreSystemCursors();
+    cursorsOk = RestoreSystemCursors();
     ok1 = SendDeviceIoctl(L"\\\\.\\SwitchBacklight", IOCTL_SWFAN_SET_POWER_MODE,
-                          &zero, sizeof(zero), NULL, 0, &err1);
+                          &baseline, sizeof(baseline), NULL, 0, &err1);
     ok2 = SendDeviceIoctl(L"\\\\.\\SwitchBattery", IOCTL_SWBAT_SET_CHARGE_LIMIT,
                           &zero, sizeof(zero), NULL, 0, &err2);
     RefreshDriverStatuses();
     UpdateTrayVisuals();
+    if (ok1 && (!g_app.HavePower || g_app.Power.PowerMode != SwFanPowerModeDefaultFixed)) {
+        ok1 = FALSE;
+        err1 = g_app.PowerError ? g_app.PowerError : ERROR_INVALID_DATA;
+    }
+    if (ok2 && (!g_app.HaveBattery || g_app.Battery.LimitCenter != 0u)) {
+        ok2 = FALSE;
+        err2 = g_app.BatteryError ? g_app.BatteryError : ERROR_INVALID_DATA;
+    }
 
-    if (!quiet && (!ok1 || !ok2)) {
+    if (!quiet && (!ok1 || !ok2 || !cursorsOk)) {
         WCHAR e1[160], e2[160], msg[420];
         FormatWin32Error(err1, e1, sizeof(e1) / sizeof(e1[0]));
         FormatWin32Error(err2, e2, sizeof(e2) / sizeof(e2[0]));
         _snwprintf(msg, sizeof(msg) / sizeof(msg[0]),
-                   L"Reset completed with driver warnings:\n  Power Mode 0: %s\n  Charging Limit Off: %s",
-                   ok1 ? L"OK" : e1, ok2 ? L"OK" : e2);
+                   L"Reset failed or incomplete:\n  Windows baseline: %s\n  Charging Limit Off: %s\n  Cursors: %s",
+                   ok1 ? L"OK" : e1, ok2 ? L"OK" : e2, cursorsOk ? L"OK" : L"Restore failed");
         msg[(sizeof(msg) / sizeof(msg[0])) - 1] = L'\0';
         MessageBoxW(hwnd, msg, APP_NAME, MB_OK | MB_ICONWARNING);
     }
+    if (!ok1) return err1;
+    if (!ok2) return err2;
+    return cursorsOk ? ERROR_SUCCESS : ERROR_GEN_FAILURE;
 }
 
 /* ------------------------------------------------------------ Window Proc */
 
 static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    if (g_taskbarCreated != 0 && msg == g_taskbarCreated) {
+        /* Explorer removes all notification icons when its taskbar restarts. */
+        g_app.IconAdded = FALSE;
+        UpdateTrayVisuals();
+        return 0;
+    }
     switch (msg) {
     case WM_CREATE:
         RefreshDriverStatuses();
@@ -903,7 +940,6 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         g_app.Nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         g_app.Nid.uCallbackMessage = WM_TRAYICON;
         UpdateTrayVisuals();
-        g_app.IconAdded = Shell_NotifyIconW(NIM_ADD, &g_app.Nid);
         g_app.LastMoveTick = GetTickCount64();
         UpdateCursorTimerInterval(hwnd);
         SetTimer(hwnd, TIMER_ID_STATUS, STATUS_POLL_MS, NULL);
@@ -996,6 +1032,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
 
     case WM_DESTROY:
+        if (g_loadStop) SetEvent(g_loadStop);
         KillTimer(hwnd, TIMER_ID_CURSOR);
         KillTimer(hwnd, TIMER_ID_STATUS);
         (void)RestoreSystemCursors();
@@ -1025,14 +1062,18 @@ static void StopRunningTrayInstance(void)
 
 static int RunUninstallOrRestore(BOOL fullUninstall, BOOL resetDrivers)
 {
+    DWORD error;
     StopRunningTrayInstance();
-    (void)RestoreSystemCursors();
-    if (resetDrivers) {
-        ResetAllToDefaults(NULL, TRUE);
+    error = resetDrivers ? ResetAllToDefaults(NULL, TRUE) :
+        (RestoreSystemCursors() ? ERROR_SUCCESS : ERROR_GEN_FAILURE);
+    if (error != ERROR_SUCCESS) {
+        return (int)error;
     }
     if (fullUninstall) {
-        (void)SetAutostartEnabledEx(REG_RUN_VALUE, FALSE);
-        (void)RegDeleteKeyW(HKEY_CURRENT_USER, REG_SETTINGS_KEY);
+        LSTATUS st = SetAutostartEnabledEx(REG_RUN_VALUE, FALSE);
+        if (st != ERROR_SUCCESS) return (int)st;
+        st = RegDeleteKeyW(HKEY_CURRENT_USER, REG_SETTINGS_KEY);
+        if (st != ERROR_SUCCESS && st != ERROR_FILE_NOT_FOUND) return (int)st;
     }
     return 0;
 }
@@ -1121,8 +1162,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLin
             return RunSelfTest();
         }
         if (wcsstr(lpCmdLine, L"--restore-cursors") != NULL) {
-            (void)RestoreSystemCursors();
-            return 0;
+            return RestoreSystemCursors() ? 0 : 1;
         }
         if (wcsstr(lpCmdLine, L"--restore-defaults") != NULL) {
             return RunUninstallOrRestore(FALSE, TRUE);
@@ -1147,6 +1187,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLin
     }
 
     g_app.AutoHideEnabled = ReadRegDword(REG_SETTINGS_KEY, REG_AUTOHIDE_VALUE, 1u) != 0;
+    g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     memset(&wc, 0, sizeof(wc));
     wc.cbSize = sizeof(wc);
@@ -1165,11 +1206,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLin
         return 1;
     }
 
+    g_loadStop = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (g_loadStop) g_loadThread = CreateThread(NULL, 0, CpuLoadWorker, NULL, 0, NULL);
+
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
+    if (g_loadStop) SetEvent(g_loadStop);
+    if (g_loadThread) {
+        CancelSynchronousIo(g_loadThread);
+        if (WaitForSingleObject(g_loadThread, 2000) == WAIT_OBJECT_0) {
+            CloseHandle(g_loadStop); g_loadStop = NULL;
+        }
+        CloseHandle(g_loadThread);
+    } else if (g_loadStop) CloseHandle(g_loadStop);
     (void)RestoreSystemCursors();
     CloseHandle(singleMutex);
     return (int)msg.wParam;

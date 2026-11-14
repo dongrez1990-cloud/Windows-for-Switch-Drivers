@@ -1,11 +1,13 @@
 /* Host ASan/UBSan test of SwitchFan MAX77812 SPB serialization (PmicLock),
- * M1 voltage/enable safety bounds, and Power Mode 0..4 transitions/readbacks.
+ * M1 voltage/enable safety bounds, and Switchroot mode transactions/readbacks. DFLL MMIO is a model, not hardware acceptance.
  */
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
+#include <time.h>
 #include "../src/t214/performance.h"
 
 typedef uint32_t ULONG;
@@ -14,6 +16,8 @@ typedef uint8_t *PUCHAR;
 typedef uintptr_t ULONG_PTR;
 typedef int32_t LONG;
 typedef int32_t NTSTATUS;
+typedef uint64_t ULONGLONG;
+typedef int64_t LONGLONG;
 typedef bool BOOLEAN;
 typedef unsigned KIRQL;
 typedef void VOID;
@@ -39,6 +43,7 @@ typedef struct { int64_t Timeout; } WDF_REQUEST_SEND_OPTIONS;
 #define STATUS_DEVICE_DATA_ERROR         -7
 #define STATUS_DEVICE_PROTOCOL_ERROR     -8
 #define STATUS_IO_TIMEOUT                -9
+#define STATUS_DEVICE_HARDWARE_ERROR     -10
 #define RTL_NUMBER_OF(a) (sizeof(a) / sizeof((a)[0]))
 #define WDF_REQUEST_SEND_OPTION_TIMEOUT 1
 #define WDF_REL_TIMEOUT_IN_MS(n) (n)
@@ -58,6 +63,13 @@ static UCHAR pmic_regs[256];
 static ULONG car_regs[64];
 static char order_log[128];
 static unsigned order_len = 0;
+static pthread_mutex_t cpu_guard = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t step_guard = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t step_changed = PTHREAD_COND_INITIALIZER;
+static bool pause_cpu_down, down_waiting, temperature_waiting, allow_down;
+static _Thread_local bool cpu_locked, temperature_thread;
+
+#include "../src/t214/dfll_windows_types.h"
 
 typedef struct {
     UCHAR *Car;
@@ -76,6 +88,11 @@ typedef struct {
     ULONG PowerMode, PolicySeq;
     volatile LONG GpuDvfsPolicy;
     ULONG GpuReportedKhz, GpuReportedUv, GpuStatusWord;
+    SWFAN_DFLL Dfll;
+    ULONGLONG GpuSampleTime;
+    ULONGLONG GpuAbiTime;
+    ULONGLONG TempSampleTime;
+    ULONG SocTempC, BoardTempC;
 } SWFAN_DEVICE, *PSWFAN_DEVICE;
 
 struct mock_request {
@@ -86,6 +103,27 @@ struct mock_request {
 };
 
 #define SWFAN_HAVE_PMIC_LOCK 1
+#define SWFAN_HAVE_CPU_LOCK 1
+static VOID SwFanCpuLock(PSWFAN_DEVICE Dev)
+{
+    (void)Dev;
+    assert(!cpu_locked);
+    if (temperature_thread) {
+        pthread_mutex_lock(&step_guard);
+        temperature_waiting = true;
+        pthread_cond_broadcast(&step_changed);
+        pthread_mutex_unlock(&step_guard);
+    }
+    pthread_mutex_lock(&cpu_guard);
+    cpu_locked = true;
+}
+static VOID SwFanCpuUnlock(PSWFAN_DEVICE Dev)
+{
+    (void)Dev;
+    assert(cpu_locked);
+    cpu_locked = false;
+    pthread_mutex_unlock(&cpu_guard);
+}
 static void WdfWaitLockAcquire(WDFWAITLOCK l, void *t)
 {
     (void)t;
@@ -149,6 +187,16 @@ static NTSTATUS WdfIoTargetSendWriteSynchronously(void *t, void *r,
     (void)r; (void)o; (void)s;
     assert(t != NULL && pmic_locked && m->Size == 2);
     if (fail_pmic_write) return STATUS_IO_TIMEOUT;
+    if (b[0] == 0x26 && b[1] < 174u) {
+        pthread_mutex_lock(&step_guard);
+        if (pause_cpu_down) {
+            assert(cpu_locked);
+            down_waiting = true;
+            pthread_cond_broadcast(&step_changed);
+            while (!allow_down) pthread_cond_wait(&step_changed, &step_guard);
+        }
+        pthread_mutex_unlock(&step_guard);
+    }
     pmic_regs[b[0]] = b[1];
     if (order_len < sizeof(order_log)) order_log[order_len++] = 'V';
     *n = 2;
@@ -158,22 +206,107 @@ static void KeDelayExecutionThread(int m, bool a, LARGE_INTEGER *d) { (void)m; (
 static void KeRaiseIrql(unsigned i, KIRQL *o) { (void)i; *o = 0; }
 static void KeLowerIrql(KIRQL i) { (void)i; }
 static void KeStallExecutionProcessor(unsigned n) { (void)n; }
+static ULONGLONG KeQueryInterruptTime(void) { return 10000000; }
+#define KeMemoryBarrier() ((void)0)
 static LONG InterlockedExchange(volatile LONG *dst, LONG val)
 { LONG old = *dst; *dst = val; return old; }
 static LONG InterlockedCompareExchange(volatile LONG *dst, LONG exch, LONG comp)
 { LONG cur = *dst; if (cur == comp) *dst = exch; return cur; }
 
-#define READ_REGISTER_ULONG(p) (*(p))
+static ULONG dfll_regs[0x300 / 4], sources[2], reset_dvco, bank[3], resets[2], gates[2], i2c_source;
+static bool dfll_bad_monitor;
+static void dfll_settle(void)
+{
+    ULONG cfg = dfll_regs[SW_DFLL_OUTPUT_CFG / 4];
+    ULONG force = dfll_regs[SW_DFLL_FORCE / 4];
+    int idx;
+    if (!(cfg & SW_DFLL_I2C_ENABLE)) return;
+    if (force & 0x40u) idx = force & 63u;
+    else if (dfll_regs[0] == 2) {
+        int f = (dfll_regs[SW_DFLL_FREQ_REQ / 4] >> 16) & 4095;
+        if (f & 2048) f -= 4096;
+        idx = ((cfg >> 24) & 63) + f / 64;
+        if (idx < (int)((cfg >> 8) & 63)) idx = (cfg >> 8) & 63;
+        if (idx > (int)((cfg >> 16) & 63)) idx = (cfg >> 16) & 63;
+    } else return;
+    assert(idx >= 0 && idx < 33);
+    pmic_regs[0x26] = (UCHAR)dfll_regs[SW_DFLL_LUT / 4 + idx];
+    dfll_regs[SW_DFLL_I2C_STS / 4] = (ULONG)idx << 1;
+}
+static ULONG regread(ULONG *p)
+{
+    if (p == &dfll_regs[SW_DFLL_MON_DATA / 4])
+        return (1u << 16) | (dfll_bad_monitor ? 1u : (dfll_regs[SW_DFLL_FREQ_REQ / 4] & 127u) * 2u);
+    return *p;
+}
+#define READ_REGISTER_ULONG(p) regread(p)
 static void regwrite(ULONG *p, ULONG v)
 {
+    assert(cpu_locked);
     if (order_len < sizeof(order_log)) order_log[order_len++] = 'C';
     *p = v;
     if (p == car_regs + 0xe0 / 4 && (v & (1u << 30))) *p |= 1u << 27;
+    if (p == resets) { bank[0] |= v; memset(dfll_regs,0,sizeof(dfll_regs)); }
+    if (p == resets + 1) bank[0] &= ~v;
+    if (p == gates) bank[2] |= v;
+    if (p == gates + 1) bank[2] &= ~v;
+    dfll_settle();
 }
 #define WRITE_REGISTER_ULONG(p, v) regwrite((p), (v))
-
+#define SWFAN_HAVE_DFLL 1
+static ULONG SwFanDfllReadKhz(PSWFAN_DEVICE);
+static NTSTATUS SwFanDfllStopLocked(PSWFAN_DEVICE);
+static NTSTATUS SwFanDvfsUpdateLocked(PSWFAN_DEVICE, ULONG, BOOLEAN);
 #include "../src/t214/clock.h"
+#include "../src/t214/dfll_windows.h"
 #include "../src/t214/gpu_pmic.h"
+
+static void wait_step(bool *flag)
+{
+    struct timespec until;
+    assert(clock_gettime(CLOCK_REALTIME, &until) == 0);
+    until.tv_sec += 5;
+    while (!*flag) assert(pthread_cond_timedwait(&step_changed, &step_guard, &until) == 0);
+}
+
+static void *eco_thread(void *p)
+{
+    assert(SwCpuApply(p, FALSE) == STATUS_SUCCESS);
+    return NULL;
+}
+
+static void *thermal_thread(void *p)
+{
+    temperature_thread = true;
+    SwCpuTemperature(p, 40u, TRUE);
+    return NULL;
+}
+
+static void test_concurrent_cpu_policy(PSWFAN_DEVICE d)
+{
+    pthread_t eco, thermal;
+    assert(SwFanSetPowerMode(d, SwFanPowerModeDefaultFixed) == STATUS_SUCCESS);
+    assert(d->CpuApplied && d->CpuOverclockEnabled);
+    pause_cpu_down = true;
+    down_waiting = temperature_waiting = allow_down = false;
+    assert(pthread_create(&eco, NULL, eco_thread, d) == 0);
+    pthread_mutex_lock(&step_guard);
+    wait_step(&down_waiting);
+    assert(pthread_create(&thermal, NULL, thermal_thread, d) == 0);
+    wait_step(&temperature_waiting);
+    /* Suspend is paused between F-down and V-down. The temperature callback must
+     * not enter the CPU transaction until the complete voltage-down finishes. */
+    assert(pthread_mutex_trylock(&cpu_guard) != 0);
+    assert(SwCpuKhz(d) == d->BootCpuKhz);
+    allow_down = true;
+    pthread_cond_broadcast(&step_changed);
+    pthread_mutex_unlock(&step_guard);
+    assert(pthread_join(eco, NULL) == 0);
+    assert(pthread_join(thermal, NULL) == 0);
+    pause_cpu_down = false;
+    assert(d->CpuApplied && d->CpuOverclockEnabled);
+    assert(SwCpuKhz(d) == CPU_TARGET_KHZ && pmic_regs[CPU_M4_VOUT] == CPU_OC_VOUT);
+}
 
 static NTSTATUS send_gpu_pmic(PSWFAN_DEVICE d, struct tg_gpu_pmic_request *op)
 {
@@ -199,8 +332,19 @@ int main(void)
     pmic_regs[0x26] = 110;  /* 800 mV boot CPU M4 */
     car_regs[0x20 / 4] = 0x20008888u;
     car_regs[0xe0 / 4] = (1u << 30) | (1u << 27) | (2u << 20) | (156u << 8) | 2u; /* 998.4 MHz */
-    car_regs[0xa0 / 4] = 0x50000000u;
+    car_regs[0xa0 / 4] = (1u<<30) | (85u<<8) | 8u; /* 408 MHz PLLP */
 
+    d.Dfll.Map[SwDfllMmio] = (UCHAR *)dfll_regs;
+    d.Dfll.Map[SwDfllSources] = (UCHAR *)sources;
+    d.Dfll.Map[SwDfllReset] = (UCHAR *)&reset_dvco;
+    d.Dfll.Map[SwDfllBankStatus] = (UCHAR *)bank;
+    d.Dfll.Map[SwDfllBankReset] = (UCHAR *)resets;
+    d.Dfll.Map[SwDfllBankEnable] = (UCHAR *)gates;
+    d.Dfll.Map[SwDfllI2cSource] = (UCHAR *)&i2c_source;
+    i2c_source = 4; /* integer divide by 5 */
+    d.Dfll.Handoff = (LITE_DFLL_HANDOFF){LITE_DFLL_HANDOFF_MAGIC, LITE_DFLL_HANDOFF_VERSION,
+        sizeof(LITE_DFLL_HANDOFF), 0x2120, 0x83, 1630, 0, 0x33};
+    d.PowerMode = SwFanPowerModeDefaultFixed;
     d.IsLite = TRUE;
     d.BacklightReady = TRUE;
     d.DisplayState = 1;
@@ -265,50 +409,56 @@ int main(void)
     op = (struct tg_gpu_pmic_request){ 0x33, 0x06, 1, 1 };
     assert(send_gpu_pmic(&d, &op) == STATUS_SUCCESS);
 
-    /* 4. Power Modes 0..4 + live hardware readbacks. */
+    /* Profiles follow the captured nvpmodel requests, and use the DFLL
+     * adapter/core, not the legacy two PLLX steps. */
     SwFanGetPowerStatus(&d, &st);
-    assert(st.PowerMode == SwFanPowerModeDefaultFixed && st.CpuActualKhz == 1497600u);
-    assert(st.CpuMv == 1120u && st.GpuPolicyMode == 0 && st.GpuPolicyMaxKhz == 460800u);
+    assert(st.PowerMode == 7 && st.CpuActualKhz == 1497600u);
+    assert(SwFanSetPowerMode(&d, SwFanPowerModeHandheld) == STATUS_NOT_SUPPORTED);
+    op = (struct tg_gpu_pmic_request){0,TG_GPU_PMIC_QUERY_DVFS_POLICY,0,0};
+    assert(send_gpu_pmic(&d,&op) == STATUS_SUCCESS);
+    assert(SwFanSetPowerMode(&d, SwFanPowerModeHandheld) == STATUS_NOT_SUPPORTED);
+    op=(struct tg_gpu_pmic_request){0,TG_GPU_PMIC_REPORT_GPU_KHZ,1,460800};
+    assert(send_gpu_pmic(&d,&op)==STATUS_SUCCESS && !d.GpuSampleTime);
+    op=(struct tg_gpu_pmic_request){0,TG_GPU_PMIC_REPORT_ABI,1,TG_GPU_LIVE_COUNTER_ABI};
+    assert(send_gpu_pmic(&d,&op)==STATUS_SUCCESS);
+    assert(SwFanDfllAvailable(&d));
+    for (ULONG mode=0; mode < SwNvpCount; ++mode) {
+        assert(SwFanSetPowerMode(&d,mode) == STATUS_SUCCESS);
+        SwFanGetPowerStatus(&d,&st);
+        assert(st.PowerMode == mode && st.CpuDfllActive && !d.CpuApplied);
+        assert(st.CpuRequestedMaxKhz == sw_nvpmodel_profiles[mode].cpu_max_khz);
+        assert(st.CpuActualKhz == (sw_nvpmodel_profiles[mode].cpu_overclock ? 2397000u : mode==1 ? 1581000u : 1963500u));
+        assert(st.GpuPolicyMaxKhz == (mode==1 ? 537600u : mode==3 || mode==4 || mode==6 ? 1228800u : 844800u));
+        assert(st.GpuPolicyMinKhz == (mode>=5 ? 460800u : 76800u));
+    }
+    assert(SwFanSetPowerMode(&d,7) == STATUS_SUCCESS);
+    assert(!d.Dfll.Control.active && SwCpuKhz(&d)==1497600u && pmic_regs[0x26]==174);
+    assert(!d.Dfll.ClocksOwned && !bank[2]);
 
-    /* Mode 1 (Eco): F-down to 998.4 MHz BEFORE V-down to 800 mV! */
-    order_len = 0;
-    assert(SwFanSetPowerMode(&d, SwFanPowerModeEcoDynamic) == STATUS_SUCCESS);
-    assert(!d.CpuApplied && SwCpuKhz(&d) == 998400u && pmic_regs[0x26] == 110);
-    assert(order_len >= 2 && order_log[0] == 'C' && order_log[order_len - 1] == 'V');
+    /* A missing/unknown handoff cannot silently turn on the new clock path. */
+    d.Dfll.Handoff.CpuSpeedo=0;
+    assert(SwFanSetPowerMode(&d,0)==STATUS_NOT_SUPPORTED && d.PowerMode==7);
+    d.Dfll.Handoff.CpuSpeedo=1630;
+    /* A monitor failure recovers to boot PLLX, latches the policy failure,
+     * and a later temperature poll cannot automatically re-enter DFLL. */
+    dfll_bad_monitor=true;
+    assert(SwFanSetPowerMode(&d,0)==STATUS_DEVICE_HARDWARE_ERROR);
+    assert(d.Dfll.FaultLatched && SwCpuKhz(&d)==d.BootCpuKhz && d.PowerMode==7);
+    dfll_bad_monitor=false;
+    SwCpuTemperature(&d,40,TRUE);
+    assert(!d.Dfll.Control.active && SwCpuKhz(&d)==d.BootCpuKhz);
+    assert(SwFanSetPowerMode(&d,7)==STATUS_SUCCESS && !d.Dfll.FaultLatched);
+    test_concurrent_cpu_policy(&d);
 
-    /* Mode 3 (Console Dynamic 768 MHz): V-up to 1120 mV BEFORE F-up to 1497.6 MHz! */
-    order_len = 0;
-    assert(SwFanSetPowerMode(&d, SwFanPowerModeConsoleDynamic) == STATUS_SUCCESS);
-    assert(d.CpuApplied && SwCpuKhz(&d) == 1497600u && pmic_regs[0x26] == 174);
-    assert(order_len >= 2 && order_log[0] == 'V' && order_log[1] == 'C');
-    op = (struct tg_gpu_pmic_request){ 0, TG_GPU_PMIC_QUERY_DVFS_POLICY, 0, 0 };
-    assert(send_gpu_pmic(&d, &op) == STATUS_SUCCESS);
-    assert(TG_GPU_DVFS_POLICY_MODE(op.value) == 1 &&
-           TG_GPU_DVFS_POLICY_MIN_KHZ(op.value) == 153600u &&
-           TG_GPU_DVFS_POLICY_MAX_KHZ(op.value) == 768000u);
-
-    /* Mode 4 (Max HighOPT 844.8 MHz) + KMD live telemetry report -> GetPowerStatus. */
-    assert(SwFanSetPowerMode(&d, SwFanPowerModeMaxHighOpt) == STATUS_SUCCESS);
-    op = (struct tg_gpu_pmic_request){ 0, TG_GPU_PMIC_REPORT_GPU_KHZ, 1, 844800u };
-    assert(send_gpu_pmic(&d, &op) == STATUS_SUCCESS);
-    op = (struct tg_gpu_pmic_request){ 0, TG_GPU_PMIC_REPORT_GPU_UV, 1, 610000u };
-    assert(send_gpu_pmic(&d, &op) == STATUS_SUCCESS);
-    SwFanGetPowerStatus(&d, &st);
-    assert(st.PowerMode == SwFanPowerModeMaxHighOpt && st.GpuPolicyMaxKhz == 844800u);
-    assert(st.GpuReportedKhz == 844800u && st.GpuReportedUv == 610000u);
-    assert((st.Flags & SWFAN_POWER_FLAG_GPU_BRIDGE_SEEN) != 0);
-
-    /* Failure propagation: I2C timeout during Eco downvolt returns real error! */
-    fail_pmic_write = true;
-    assert(SwFanSetPowerMode(&d, SwFanPowerModeEcoDynamic) == STATUS_IO_TIMEOUT);
-    fail_pmic_write = false;
-    assert(!pmic_locked);
-
+    op=(struct tg_gpu_pmic_request){0,TG_GPU_PMIC_REPORT_GPU_KHZ,1,844800};
+    assert(send_gpu_pmic(&d,&op)==STATUS_SUCCESS);
+    SwFanGetPowerStatus(&d,&st);
+    assert(st.GpuReportedKhz==844800 && st.GpuSampleAgeMs==0);
     /* Unsupported / invalid inputs rejected cleanly. */
-    assert(SwFanSetPowerMode(&d, 5) == STATUS_INVALID_PARAMETER);
+    assert(SwFanSetPowerMode(&d, 8) == STATUS_INVALID_PARAMETER);
     d.IsLite = FALSE;
     assert(SwFanSetPowerMode(&d, 0) == STATUS_NOT_SUPPORTED);
 
-    puts("PASS: SwitchFan PmicLock serialization, M1 Vmin/Vmax bounds and Power Mode 0..4 readbacks");
+    puts("PASS: SwitchFan PmicLock serialization, M1 Vmin/Vmax bounds and Switchroot 0..6 modes, DFLL ownership and recovery (MMIO model)");
     return 0;
 }

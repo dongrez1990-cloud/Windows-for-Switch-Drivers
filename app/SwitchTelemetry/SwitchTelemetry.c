@@ -16,7 +16,7 @@
 #define GPU_KEY L"SYSTEM\\CurrentControlSet\\Services\\tegragpurender\\Parameters"
 
 typedef struct {
-    DWORD cpu, gpu, ram, fan, cpu_mv, gpu_uv, temp, ram_config;
+    DWORD cpu, gpu, ram, fan, cpu_mv, gpu_uv, temp, gpu_age;
     BOOL cpu_ok, gpu_ok, ram_ok, fan_ok, temp_ok, live_bridge, gpu_live, fan_fresh;
     DWORD error;
     SYSTEMTIME time;
@@ -47,11 +47,12 @@ static SAMPLE ReadSample(void)
         BOOL ok = DeviceIoControl(device, IOCTL_SWFAN_GET_POWER_STATUS, NULL, 0,
                                   buffer, sizeof(buffer), &bytes, NULL);
         s.error = ok ? 0 : GetLastError();
-        if (ok && bytes >= sizeof(SWFAN_POWER_STATUS) && power->Version == SWFAN_POWER_STATUS_VERSION) {
+        if (ok && bytes >= 19u * sizeof(DWORD) && (power->Version == 1u || power->Version == 2u)) {
             s.live_bridge = TRUE;
             s.cpu = power->CpuActualKhz; s.cpu_ok = s.cpu != 0;
             s.gpu = power->GpuReportedKhz; s.gpu_ok = s.gpu != 0;
-            s.gpu_live = s.gpu_ok;
+            s.gpu_age = power->Version == 2u && bytes >= sizeof(*power) ? power->GpuSampleAgeMs : ~0u;
+            s.gpu_live = s.gpu_ok && s.gpu_age <= 2000u && (power->Flags & SWFAN_POWER_FLAG_LIVE_GPU_COUNTER);
             s.ram = power->RamActualKhz; s.ram_ok = s.ram != 0;
             s.fan = power->FanDuty; s.fan_ok = s.fan <= 236u;
             s.cpu_mv = power->CpuMv; s.gpu_uv = power->GpuReportedUv;
@@ -77,10 +78,9 @@ static SAMPLE ReadSample(void)
                 s.fan_fresh = a.QuadPart >= b.QuadPart && a.QuadPart - b.QuadPart <= 100000000ULL;
             }
         }
-        (void)ReadDword(key, L"RamTargetKhz", &s.ram_config);
         RegCloseKey(key);
     }
-    if (!s.gpu_ok && RegOpenKeyExW(HKEY_LOCAL_MACHINE, GPU_KEY, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+    if (!s.gpu_ok && !s.live_bridge && RegOpenKeyExW(HKEY_LOCAL_MACHINE, GPU_KEY, 0, KEY_READ, &key) == ERROR_SUCCESS) {
         s.gpu_ok = ReadDword(key, L"BootGpuMeasuredKhz", &s.gpu) && s.gpu != 0;
         (void)ReadDword(key, L"BootGpuRailUv", &s.gpu_uv);
         RegCloseKey(key);
@@ -154,8 +154,9 @@ static void Paint(HWND hwnd)
         (s.fan_fresh ? L"驱动定期更新" : L"驱动缓存未更新"), s.cpu_mv, s.cpu_mv ? L"" : L"（未提供电压）");
     Card(memory, cards[0], L"CPU", value, detail, RGB(89, 173, 255));
     Frequency(value, 96, s.gpu_ok, s.gpu);
-    _snwprintf(detail, 220, L"%s\n%lu mV", s.gpu_live ? L"KMD 最近硬件计数器读数" :
-        (s.gpu_ok ? L"启动时硬件计数器 · 非实时" : L"等待 GPU 驱动读数"), s.gpu_uv / 1000u);
+    _snwprintf(detail, 220, L"%s\n%lu mV", s.gpu_live ? L"GPCCLK 硬件计数器 · 2秒内采样" :
+        (s.gpu_ok ? (s.live_bridge ? L"KMD 上次采样 · 已过期" : L"启动时硬件计数器 · 非实时") :
+         L"等待 GPU 驱动读数"), s.gpu_uv / 1000u);
     Card(memory, cards[1], L"GPU", value, detail, RGB(77, 214, 170));
     Frequency(value, 96, s.ram_ok, s.ram);
     _snwprintf(detail, 220, L"EMC 运行频率\n%s", s.ram_ok ? L"固件交接读回；当前 RAM 不动态调频" : L"固件未提供有效实际频率");

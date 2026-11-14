@@ -23,6 +23,10 @@ if [ "${BUILD_X64:-0}" = "1" ]; then
         "$src/SwitchPowerTray.c" \
         -luser32 -lshell32 -ladvapi32 -lgdi32 \
         -o "$out/SwitchPowerTray-x64.exe"
+    "$mingw_bin/x86_64-w64-mingw32-clang" \
+        -std=c11 -O2 -Wall -Wextra -Werror -Wno-format-truncation -municode \
+        "$src/tests/contracts.c" -luser32 -lshell32 -ladvapi32 -lgdi32 \
+        -o "$out/SwitchPowerTray-contracts-x64.exe"
 fi
 
 cp "$src/Install-SwitchPowerTray.cmd" "$out/Install-SwitchPowerTray.cmd"

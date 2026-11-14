@@ -17,6 +17,8 @@
 #define TG_GPU_PMIC_REPORT_GPU_KHZ    0x105u
 #define TG_GPU_PMIC_REPORT_GPU_UV     0x106u
 #define TG_GPU_PMIC_REPORT_GPU_STATUS 0x107u
+#define TG_GPU_PMIC_REPORT_ABI        0x108u
+#define TG_GPU_LIVE_COUNTER_ABI       0x00020001u
 
 #define TG_GPU_DVFS_POLICY_PACK(mode, min_khz, max_khz, seq) \
     ((((ULONG)(mode)) & 0xfu) | \
@@ -38,6 +40,11 @@ struct tg_gpu_pmic_request {
     ULONG write;
     ULONG value;
 };
+
+static BOOLEAN SwFanGpuLiveCounter(PSWFAN_DEVICE Dev)
+{
+    return Dev->GpuAbiTime && KeQueryInterruptTime() - Dev->GpuAbiTime <= 20000000ULL;
+}
 
 static NTSTATUS SwFanGpuPmic(PSWFAN_DEVICE Dev, WDFREQUEST Request, ULONG_PTR *Info)
 {
@@ -68,7 +75,8 @@ static NTSTATUS SwFanGpuPmic(PSWFAN_DEVICE Dev, WDFREQUEST Request, ULONG_PTR *I
             if (!Dev->TempValid) return STATUS_DEVICE_NOT_READY;
             Op.value = Dev->LastTemp;
         } else if (Op.reg == TG_GPU_PMIC_QUERY_EMC_KHZ) {
-            Op.value = Dev->Config.RamActualKhz ? Dev->Config.RamActualKhz : 1600000u;
+            if (!Dev->Config.RamActualKhz) return STATUS_DEVICE_NOT_READY;
+            Op.value = Dev->Config.RamActualKhz;
         } else if (Op.reg == TG_GPU_PMIC_QUERY_DVFS_POLICY) {
             Dev->GpuBridgeSeen = TRUE;
             Op.value = (ULONG)InterlockedCompareExchange(&Dev->GpuDvfsPolicy, 0, 0);
@@ -84,12 +92,15 @@ static NTSTATUS SwFanGpuPmic(PSWFAN_DEVICE Dev, WDFREQUEST Request, ULONG_PTR *I
         if (Op.reg == TG_GPU_PMIC_REPORT_GPU_KHZ) {
             Dev->GpuBridgeSeen = TRUE;
             Dev->GpuReportedKhz = Op.value;
+            Dev->GpuSampleTime = Op.value && SwFanGpuLiveCounter(Dev) ? KeQueryInterruptTime() : 0;
         } else if (Op.reg == TG_GPU_PMIC_REPORT_GPU_UV) {
             Dev->GpuBridgeSeen = TRUE;
             Dev->GpuReportedUv = Op.value;
         } else if (Op.reg == TG_GPU_PMIC_REPORT_GPU_STATUS) {
             Dev->GpuBridgeSeen = TRUE;
             Dev->GpuStatusWord = Op.value;
+        } else if (Op.reg == TG_GPU_PMIC_REPORT_ABI) {
+            Dev->GpuAbiTime = Op.value == TG_GPU_LIVE_COUNTER_ABI ? KeQueryInterruptTime() : 0;
         } else {
             return STATUS_INVALID_PARAMETER;
         }
@@ -159,79 +170,92 @@ static NTSTATUS SwFanGpuPmic(PSWFAN_DEVICE Dev, WDFREQUEST Request, ULONG_PTR *I
     return STATUS_SUCCESS;
 }
 
+static VOID SwFanPublishGpuPolicy(PSWFAN_DEVICE Dev, ULONG Mode, ULONG Minimum, ULONG Maximum)
+{
+    ULONG Seq = (Dev->PolicySeq + 1u) & 0xfu;
+    if (!Seq) Seq = 1u;
+    Dev->PolicySeq = Seq;
+    (VOID)InterlockedExchange(&Dev->GpuDvfsPolicy,
+        (LONG)TG_GPU_DVFS_POLICY_PACK(Mode, Minimum, Maximum, Seq));
+}
+
+/* Do not retry an unsuccessful DFLL transition from the periodic timer.
+ * Only an explicit baseline selection clears this failure latch. */
+static NTSTATUS SwFanDvfsFailureLocked(PSWFAN_DEVICE Dev, NTSTATUS Cause)
+{
+    NTSTATUS Recovery = SwFanDfllStopLocked(Dev);
+    Dev->Dfll.FaultLatched = TRUE;
+    Dev->Dfll.LastStatus = NT_SUCCESS(Recovery) ? Cause : Recovery;
+    Dev->CpuThrottled = TRUE;
+    Dev->PowerMode = SwFanPowerModeDefaultFixed;
+    SwFanPublishGpuPolicy(Dev, 0, 460800u, 460800u);
+    SwFanTrace(L"CpuLastError", (ULONG)Dev->Dfll.LastStatus);
+    return Dev->Dfll.LastStatus;
+}
+
+static NTSTATUS SwFanDvfsUpdateLocked(PSWFAN_DEVICE Dev, ULONG Temp, BOOLEAN Valid)
+{
+    NTSTATUS Status;
+    Dev->LastTemp = Temp;
+    Dev->TempValid = Valid;
+    if (Dev->Dfll.FaultLatched) return Dev->Dfll.LastStatus;
+    if (!Valid || Temp >= 96u)
+        return SwFanDvfsFailureLocked(Dev, STATUS_DEVICE_NOT_READY);
+    Status = SwFanDfllApplyProfileLocked(Dev, Dev->PowerMode);
+    return NT_SUCCESS(Status) ? Status : SwFanDvfsFailureLocked(Dev, Status);
+}
+
 static NTSTATUS SwFanSetPowerMode(PSWFAN_DEVICE Dev, ULONG Mode)
 {
-    BOOLEAN WantCpuOc, ScreenOff = FALSE;
-    ULONG GpuMode, GpuMinKhz, GpuMaxKhz, Seq, Policy;
+    BOOLEAN ScreenOff = FALSE;
+    ULONG GpuMode = 0, GpuMinKhz = 460800u, GpuMaxKhz = 460800u;
     NTSTATUS Status = STATUS_SUCCESS;
-
-    if (Mode >= SwFanPowerModeCount)
-        return STATUS_INVALID_PARAMETER;
-    if (!Dev->IsLite)
-        return STATUS_NOT_SUPPORTED;
-    if (Dev->Stopping || !Dev->CpuConfigured || Dev->Pmic == NULL || Dev->Car == NULL)
-        return STATUS_DEVICE_NOT_READY;
-
-    switch (Mode) {
-    case SwFanPowerModeDefaultFixed:
-        WantCpuOc = Dev->BaseCpuOverclockEnabled;
-        GpuMode = 0; GpuMinKhz = 460800u; GpuMaxKhz = 460800u;
-        break;
-    case SwFanPowerModeEcoDynamic:
-        /* Open-loop PLLX safe step (~998.4 MHz / 800 mV BootVout); never DFLL voltages. */
-        WantCpuOc = FALSE;
-        GpuMode = 1; GpuMinKhz = 153600u; GpuMaxKhz = 460800u;
-        break;
-    case SwFanPowerModeBalancedDynamic:
-        WantCpuOc = Dev->BaseCpuOverclockEnabled;
-        GpuMode = 1; GpuMinKhz = 153600u; GpuMaxKhz = 460800u;
-        break;
-    case SwFanPowerModeConsoleDynamic:
-        WantCpuOc = Dev->BaseCpuOverclockEnabled;
-        GpuMode = 1; GpuMinKhz = 153600u; GpuMaxKhz = 768000u;
-        break;
-    case SwFanPowerModeMaxHighOpt:
-        WantCpuOc = Dev->BaseCpuOverclockEnabled;
-        GpuMode = 1; GpuMinKhz = 153600u; GpuMaxKhz = 844800u;
-        break;
-    default:
-        return STATUS_INVALID_PARAMETER;
+    if (Mode >= SwFanPowerModeCount) return STATUS_INVALID_PARAMETER;
+    if (!Dev->IsLite) return STATUS_NOT_SUPPORTED;
+    if (Mode != SwFanPowerModeDefaultFixed && !SwFanGpuLiveCounter(Dev)) return STATUS_NOT_SUPPORTED;
+    SwFanCpuLock(Dev);
+    if (Dev->Stopping || !Dev->CpuConfigured || !Dev->Pmic || !Dev->Car) {
+        SwFanCpuUnlock(Dev); return STATUS_DEVICE_NOT_READY;
     }
-
-    if (Dev->BacklightLock != NULL) WdfWaitLockAcquire(Dev->BacklightLock, NULL);
-    ScreenOff = Dev->IsLite && Dev->BacklightReady && Dev->DisplayState == 0;
-    if (Dev->BacklightLock != NULL) WdfWaitLockRelease(Dev->BacklightLock);
-
-    if (!WantCpuOc) {
-        Dev->CpuOverclockEnabled = FALSE;
-        Status = SwCpuApply(Dev, FALSE);
-        if (!NT_SUCCESS(Status)) return Status;
+    if (Dev->BacklightLock) WdfWaitLockAcquire(Dev->BacklightLock, NULL);
+    ScreenOff = Dev->BacklightReady && Dev->DisplayState == 0;
+    if (Dev->BacklightLock) WdfWaitLockRelease(Dev->BacklightLock);
+    if (Mode == SwFanPowerModeDefaultFixed) {
+        Status = SwFanDfllStopLocked(Dev);
+        if (!NT_SUCCESS(Status)) { SwFanCpuUnlock(Dev); return Status; }
+        Dev->Dfll.FaultLatched = FALSE;
+        Dev->CpuThrottled = !Dev->TempValid || Dev->LastTemp >= 80u;
+        Status = SwCpuApplyLocked(Dev, Dev->BaseCpuOverclockEnabled &&
+                                  !ScreenOff && Dev->TempValid && !Dev->CpuThrottled);
     } else {
-        Dev->CpuOverclockEnabled = TRUE;
-        if (!ScreenOff && Dev->TempValid && !Dev->CpuThrottled) {
-            if (Dev->Pwm != NULL && Dev->Duty < 51u) SwFanSetDuty(Dev, 51u);
-            Status = SwCpuApply(Dev, TRUE);
-            if (!NT_SUCCESS(Status)) return Status;
-        }
+        const struct sw_nvpmodel_profile *profile = &sw_nvpmodel_profiles[Mode];
+        if (ScreenOff) Status = STATUS_DEVICE_NOT_READY;
+        else Status = SwFanDfllApplyProfileLocked(Dev, Mode);
+        GpuMode = 1;
+        GpuMinKhz = profile->gpu_min_khz ? profile->gpu_min_khz : 76800u;
+        GpuMaxKhz = profile->gpu_max_khz > 1228800u ? 1228800u : profile->gpu_max_khz;
     }
-
-    Seq = (Dev->PolicySeq + 1u) & 0xfu;
-    if (Seq == 0) Seq = 1u;
-    Dev->PolicySeq = Seq;
-    Policy = TG_GPU_DVFS_POLICY_PACK(GpuMode, GpuMinKhz, GpuMaxKhz, Seq);
-    (VOID)InterlockedExchange(&Dev->GpuDvfsPolicy, (LONG)Policy);
+    if (!NT_SUCCESS(Status)) {
+        if (Dev->Dfll.Control.prepared || Dev->Dfll.ClocksOwned ||
+            Status == STATUS_DEVICE_HARDWARE_ERROR) Status = SwFanDvfsFailureLocked(Dev, Status);
+        SwFanCpuUnlock(Dev); return Status;
+    }
+    Dev->CpuOverclockEnabled = Dev->BaseCpuOverclockEnabled;
+    SwFanPublishGpuPolicy(Dev, GpuMode, GpuMinKhz, GpuMaxKhz);
     Dev->PowerMode = Mode;
+    SwFanCpuUnlock(Dev);
     SwFanTrace(L"PowerMode", Mode);
-    SwFanTrace(L"GpuDvfsPolicy", Policy);
     return STATUS_SUCCESS;
 }
 
 static VOID SwFanGetPowerStatus(PSWFAN_DEVICE Dev, SWFAN_POWER_STATUS *Out)
 {
-    ULONG Policy = (ULONG)InterlockedCompareExchange(&Dev->GpuDvfsPolicy, 0, 0);
+    ULONG Policy;
     BOOLEAN ScreenOff = FALSE;
     UCHAR Code = 0;
 
+    SwFanCpuLock(Dev);
+    Policy = (ULONG)InterlockedCompareExchange(&Dev->GpuDvfsPolicy, 0, 0);
     RtlZeroMemory(Out, sizeof(*Out));
     Out->Version = SWFAN_POWER_STATUS_VERSION;
     Out->IsLite = Dev->IsLite ? 1u : 0u;
@@ -240,8 +264,9 @@ static VOID SwFanGetPowerStatus(PSWFAN_DEVICE Dev, SWFAN_POWER_STATUS *Out)
     Out->CpuBootKhz = Dev->BootCpuKhz;
     Out->CpuTargetKhz = (Dev->IsLite && Dev->CpuConfigured) ?
         (Dev->CpuOverclockEnabled ? CPU_TARGET_KHZ : Dev->BootCpuKhz) : Dev->Config.CpuKhz;
+    if (Dev->PowerMode < SwNvpCount) Out->CpuTargetKhz = Dev->Dfll.Control.requested_khz;
     Out->CpuActualKhz = Dev->Car != NULL ? SwCpuKhz(Dev) : 0u;
-    Out->RamActualKhz = Dev->Config.RamActualKhz ? Dev->Config.RamActualKhz : 1600000u;
+    Out->RamActualKhz = Dev->Config.RamActualKhz;
     Out->GpuPolicyMode = TG_GPU_DVFS_POLICY_MODE(Policy);
     Out->GpuPolicyMinKhz = TG_GPU_DVFS_POLICY_MIN_KHZ(Policy);
     Out->GpuPolicyMaxKhz = TG_GPU_DVFS_POLICY_MAX_KHZ(Policy);
@@ -256,7 +281,7 @@ static VOID SwFanGetPowerStatus(PSWFAN_DEVICE Dev, SWFAN_POWER_STATUS *Out)
         SwFanPmicLock(Dev);
         if (NT_SUCCESS(SwFanReadReg(Dev->Pmic, CPU_M4_VOUT, &Code)))
             Out->CpuMv = 250u + (ULONG)Code * 5u;
-        if (Out->GpuReportedUv == 0 && NT_SUCCESS(SwFanReadReg(Dev->Pmic, GPU_M1_VOUT_REG, &Code)))
+        if (NT_SUCCESS(SwFanReadReg(Dev->Pmic, GPU_M1_VOUT_REG, &Code)))
             Out->GpuReportedUv = (250u + (ULONG)Code * 5u) * 1000u;
         SwFanPmicUnlock(Dev);
     }
@@ -268,7 +293,26 @@ static VOID SwFanGetPowerStatus(PSWFAN_DEVICE Dev, SWFAN_POWER_STATUS *Out)
     if (Dev->CpuApplied)    Out->Flags |= SWFAN_POWER_FLAG_CPU_APPLIED;
     if (Dev->CpuThrottled)  Out->Flags |= SWFAN_POWER_FLAG_CPU_THROTTLED;
     if (Dev->GpuBridgeSeen) Out->Flags |= SWFAN_POWER_FLAG_GPU_BRIDGE_SEEN;
+    if (SwFanGpuLiveCounter(Dev)) Out->Flags |= SWFAN_POWER_FLAG_LIVE_GPU_COUNTER;
     if (ScreenOff)          Out->Flags |= SWFAN_POWER_FLAG_SCREEN_OFF;
+    Out->CpuPolicyMinKhz = Dev->Dfll.CpuMinKhz;
+    Out->CpuPolicyMaxKhz = Dev->Dfll.CpuMaxKhz;
+    Out->CpuRequestedMaxKhz = Dev->Dfll.CpuRequestedMaxKhz;
+    Out->GpuRequestedMaxKhz = Dev->PowerMode < SwNvpCount ?
+        sw_nvpmodel_profiles[Dev->PowerMode].gpu_max_khz : 460800u;
+    Out->CpuSpeedo = Dev->Dfll.Handoff.CpuSpeedo;
+    Out->CpuProcessId = Dev->Dfll.Handoff.CpuProcessId;
+    Out->CpuDfllAvailable = SwFanDfllAvailable(Dev);
+    Out->CpuDfllActive = Dev->Dfll.Control.active;
+    Out->CpuLastError = (ULONG)Dev->Dfll.LastStatus;
+    Out->CpuLoadPermille = Dev->Dfll.LoadPermille;
+    Out->GpuSampleAgeMs = Dev->GpuSampleTime ?
+        (ULONG)((KeQueryInterruptTime() - Dev->GpuSampleTime) / 10000u) : ~0u;
+    Out->SocTempC = Dev->SocTempC;
+    Out->BoardTempC = Dev->BoardTempC;
+    Out->TempSampleAgeMs = Dev->TempSampleTime && Dev->TempValid ?
+        (ULONG)((KeQueryInterruptTime() - Dev->TempSampleTime) / 10000u) : ~0u;
+    SwFanCpuUnlock(Dev);
 }
 
 #endif
