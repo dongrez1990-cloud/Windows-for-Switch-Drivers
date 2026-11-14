@@ -193,3 +193,13 @@ Reference: pinned Switchroot clk-dfll.c dfll_i2c_set_output_enabled and
 is_output_i2c_req_pending. The captured-idle fixture fails with Fan18 and
 passes with Fan19 under ASan/UBSan; active-owner/pending-request rejection
 and exact saved gate/reset restoration are checked. Native acceptance pending.
+
+
+Native acceptance update: on the main display pairing, Fan19 completed modes
+1,0,2,3,4,5,6 and each return to fixed7 at 2026-11-14 22:22:15–22:23:05 UTC.
+CPU DFLL active, GPU dynamic flag/fresh counter, temperatures and RAM1600 were
+checked. All fixed returns read CPU1497600kHz/1120mV and GPU460800kHz/800000uV;
+DWM836 and native Code0 remained. This accepts short mode transitions only,
+not every OPP or sustained OC/physical-display stability. The user cancelled
+five-minute interaction. Source/build receipts are in the main chat's
+mesa-switch-woa-tgd3d-vulkan-out/dvfs-pacecar-integration/dfll-idle-handoff.
