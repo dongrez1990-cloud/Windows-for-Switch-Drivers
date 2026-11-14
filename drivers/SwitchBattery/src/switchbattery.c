@@ -119,6 +119,11 @@ typedef struct _SWBAT_DEVICE {
     ULONG UsbcChanges;
     ULONG BoostBad, BoostRestartsInRow, BoostWait, BoostRestarts;
     ULONG StuckPolls;
+    ULONG ChargeLimit;
+    BOOLEAN ChargeInhibited;
+    BOOLEAN ChargeLimitInitialized;
+    BOOLEAN SuspendChargeDisabled;
+    NTSTATUS LastLimitStatus;
 } SWBAT_DEVICE, *PSWBAT_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(SWBAT_DEVICE, SwBatGetDevice)
 
@@ -134,6 +139,7 @@ EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT SwBatEvtSelfManagedIoInit;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_SUSPEND SwBatEvtSelfManagedIoSuspend;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_RESTART SwBatEvtSelfManagedIoRestart;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_CLEANUP SwBatEvtSelfManagedIoCleanup;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL SwBatEvtIoDeviceControl;
 EVT_WDFDEVICE_WDM_IRP_PREPROCESS SwBatPreprocessDeviceControl;
 EVT_WDF_TIMER SwBatEvtTimer;
 EVT_WDF_TIMER SwBatEvtUsbcTimer;
@@ -153,6 +159,25 @@ static VOID SwBatTrace(PCWSTR Name, ULONG Value)
     if (SwBatParamsPath[0] != L'\0' && KeGetCurrentIrql() == PASSIVE_LEVEL) {
         (VOID)RtlWriteRegistryValue(RTL_REGISTRY_ABSOLUTE, SwBatParamsPath, Name, REG_DWORD, &Value, sizeof(Value));
     }
+}
+
+static ULONG SwBatReadParam(PCWSTR Name, ULONG Default)
+{
+    ULONG Value = Default;
+    RTL_QUERY_REGISTRY_TABLE Table[2];
+
+    if (SwBatParamsPath[0] == L'\0') {
+        return Default;
+    }
+    RtlZeroMemory(Table, sizeof(Table));
+    Table[0].Flags = RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK;
+    Table[0].Name = (PWSTR)Name;
+    Table[0].EntryContext = &Value;
+    Table[0].DefaultType = (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_NONE;
+    if (!NT_SUCCESS(RtlQueryRegistryValues(RTL_REGISTRY_ABSOLUTE, SwBatParamsPath, Table, NULL, NULL))) {
+        Value = Default;
+    }
+    return Value;
 }
 
 /* ------------------------------------------------------------------- I2C */
@@ -271,6 +296,8 @@ static NTSTATUS SwBatSetBqMode(PSWBAT_DEVICE Dev, UCHAR Mode)
     SwBatTrace(L"UsbcBqReg01", Verify);
     return Status;
 }
+
+#include "charge_limit.h"
 
 /* Nobody services the BQ watchdog; Linux sets ti,watchdog-timeout=0 too. */
 static VOID SwBatDisableBqWatchdog(PSWBAT_DEVICE Dev)
@@ -393,6 +420,9 @@ static NTSTATUS SwBatConfigureSink(PSWBAT_DEVICE Dev)
     }
     if (NT_SUCCESS(Status)) SwBatTrace(L"UsbcInputLimitMa", LimitMa);
     SwBatDisableBqWatchdog(Dev);
+    if (NT_SUCCESS(Status) && Dev->ChargeLimit != SWBAT_CHARGE_LIMIT_OFF) {
+        (VOID)SwBatRefreshChargeLimit(Dev);
+    }
     return Status;
 }
 
@@ -499,6 +529,9 @@ static VOID SwBatUsbcPoll(PSWBAT_DEVICE Dev)
             }
             Dev->Usbc = UsbcIdle;
             Dev->HostStreak = Dev->SinkStreak = Dev->GoneStreak = Dev->StuckPolls = 0;
+            if (Dev->ChargeLimit != SWBAT_CHARGE_LIMIT_OFF) {
+                (VOID)SwBatRefreshChargeLimit(Dev);
+            }
         } else if (Dev->PdBoard == SwBatLite && Dev->Usbc == UsbcSink && Inserted && HostSeen) {
             Dev->Usbc = UsbcIdle; /* Debounce the new source role before driving VBUS. */
             Dev->HostStreak = Dev->SinkStreak = 0;
@@ -509,6 +542,9 @@ static VOID SwBatUsbcPoll(PSWBAT_DEVICE Dev)
                 if (NT_SUCCESS(Status)) {
                     Dev->Usbc = UsbcIdle;
                     Dev->HostStreak = Dev->SinkStreak = 0;
+                    if (Dev->ChargeLimit != SWBAT_CHARGE_LIMIT_OFF) {
+                        (VOID)SwBatRefreshChargeLimit(Dev);
+                    }
                 }
             } else {
                 SwBatCheckBoost(Dev, Sys);
@@ -577,6 +613,9 @@ static VOID SwBatUsbcStart(PSWBAT_DEVICE Dev)
     SwBatTrace(L"UsbcStartState", Dev->Usbc);
     SwBatTrace(L"UsbcState", Dev->Usbc);           /* v5: otherwise a value from an earlier boot stays */
     SwBatTrace(L"UsbcStartReg01", Pwr);
+    if (Dev->Usbc != UsbcHost && Dev->ChargeLimit != SWBAT_CHARGE_LIMIT_OFF) {
+        (VOID)SwBatRefreshChargeLimit(Dev);
+    }
 }
 
 VOID SwBatEvtUsbcTimer(WDFTIMER Timer)
@@ -611,6 +650,7 @@ static NTSTATUS SwBatReadStatus(PSWBAT_DEVICE Dev, PBATTERY_STATUS Out)
     if (Percent > 100) {
         Percent = 100;
     }
+    (VOID)SwBatApplyChargeLimit(Dev, Percent);
     if (!NT_SUCCESS(SwBatReadRegs(Dev->Charger, CHARGER_SYSSTAT, &Sys, 1))) {
         Sys = 0;                     /* unknown: treat as on battery */
     }
@@ -810,6 +850,15 @@ NTSTATUS SwBatEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
     SwBatTrace(L"GaugeIdLow", Dev->GaugeId.LowPart);
     SwBatTrace(L"GaugeIdHigh", (ULONG)Dev->GaugeId.HighPart);
     SwBatTrace(L"ChargerIdLow", Dev->ChargerId.LowPart);
+    Dev->ChargeLimit = SwBatReadParam(L"ChargeLimit", SWBAT_CHARGE_LIMIT_OFF);
+    if (!SwBatChargeLimitValid(Dev->ChargeLimit)) {
+        Dev->ChargeLimit = SWBAT_CHARGE_LIMIT_OFF;
+    }
+    Dev->ChargeInhibited = FALSE;
+    Dev->ChargeLimitInitialized = FALSE;
+    Dev->SuspendChargeDisabled = FALSE;
+    Dev->LastLimitStatus = STATUS_SUCCESS;
+    SwBatTrace(L"ChargeLimit", Dev->ChargeLimit);
     return (Dev->Connections >= 2) ? STATUS_SUCCESS : STATUS_DEVICE_CONFIGURATION_ERROR;
 }
 
@@ -951,6 +1000,11 @@ NTSTATUS SwBatEvtSelfManagedIoSuspend(WDFDEVICE Device)
         if (NT_SUCCESS(Status)) Dev->Usbc = UsbcIdle;
         WdfWaitLockRelease(Dev->Lock);
     }
+    if (Dev->ChargeLimit != SWBAT_CHARGE_LIMIT_OFF && Dev->Charger != NULL) {
+        WdfWaitLockAcquire(Dev->Lock, NULL);
+        (VOID)SwBatSuspendChargeLimit(Dev);
+        WdfWaitLockRelease(Dev->Lock);
+    }
     return STATUS_SUCCESS;
 }
 
@@ -963,6 +1017,72 @@ VOID SwBatEvtSelfManagedIoCleanup(WDFDEVICE Device)
         Dev->ClassHandle = NULL;
     }
     WdfWaitLockRelease(Dev->ClassLock);
+}
+
+VOID SwBatEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputBufferLength, size_t InputBufferLength, ULONG IoControlCode)
+{
+    WDFDEVICE Device = WdfIoQueueGetDevice(Queue);
+    PSWBAT_DEVICE Dev = SwBatGetDevice(Device);
+    ULONG_PTR Bytes = 0;
+    NTSTATUS Status;
+
+    switch (IoControlCode) {
+    case IOCTL_SWBAT_GET_CHARGE_LIMIT: {
+        SWBAT_CHARGE_LIMIT_STATUS *Out = NULL;
+        UNREFERENCED_PARAMETER(InputBufferLength);
+        if (OutputBufferLength < sizeof(*Out)) {
+            Status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        Status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*Out), (PVOID *)&Out, NULL);
+        if (!NT_SUCCESS(Status)) {
+            break;
+        }
+        WdfWaitLockAcquire(Dev->Lock, NULL);
+        Status = SwBatQueryChargeLimitStatus(Dev, Out);
+        WdfWaitLockRelease(Dev->Lock);
+        if (NT_SUCCESS(Status)) {
+            Bytes = sizeof(*Out);
+        }
+        break;
+    }
+    case IOCTL_SWBAT_SET_CHARGE_LIMIT: {
+        PULONG In = NULL;
+        ULONG NewLimit = 0;
+        BATTERY_STATUS Now;
+        BOOLEAN Notify = FALSE;
+        UNREFERENCED_PARAMETER(OutputBufferLength);
+        if (InputBufferLength < sizeof(ULONG)) {
+            Status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        Status = WdfRequestRetrieveInputBuffer(Request, sizeof(ULONG), (PVOID *)&In, NULL);
+        if (!NT_SUCCESS(Status)) {
+            break;
+        }
+        NewLimit = *In;
+        WdfWaitLockAcquire(Dev->Lock, NULL);
+        Status = SwBatSetChargeLimitValue(Dev, NewLimit, &Notify);
+        if (NT_SUCCESS(Status) && NT_SUCCESS(SwBatReadStatus(Dev, &Now))) {
+            if (Now.PowerState != Dev->Last.PowerState || Now.Capacity != Dev->Last.Capacity) {
+                Notify = TRUE;
+            }
+            Dev->Last = Now;
+        }
+        WdfWaitLockRelease(Dev->Lock);
+        if (NT_SUCCESS(Status)) {
+            SwBatTrace(L"ChargeLimit", NewLimit);
+            if (Notify && Dev->ClassHandle != NULL) {
+                (VOID)BatteryClassStatusNotify(Dev->ClassHandle);
+            }
+        }
+        break;
+    }
+    default:
+        Status = STATUS_INVALID_DEVICE_REQUEST;
+        break;
+    }
+    WdfRequestCompleteWithInformation(Request, Status, Bytes);
 }
 
 NTSTATUS SwBatPreprocessDeviceControl(WDFDEVICE Device, PIRP Irp)
@@ -991,6 +1111,9 @@ NTSTATUS SwBatEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
 {
     WDF_PNPPOWER_EVENT_CALLBACKS Pnp;
     WDF_OBJECT_ATTRIBUTES Attributes;
+    WDF_IO_QUEUE_CONFIG QueueConfig;
+    DECLARE_CONST_UNICODE_STRING(DeviceName, L"\\Device\\SwitchBattery");
+    DECLARE_CONST_UNICODE_STRING(LinkName, L"\\DosDevices\\SwitchBattery");
     WDFDEVICE Device;
     PSWBAT_DEVICE Dev;
     NTSTATUS Status;
@@ -1006,6 +1129,8 @@ NTSTATUS SwBatEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     Status = WdfDeviceInitAssignWdmIrpPreprocessCallback(DeviceInit,
         SwBatPreprocessDeviceControl, IRP_MJ_DEVICE_CONTROL, NULL, 0);
     if (!NT_SUCCESS(Status)) return Status;
+    Status = WdfDeviceInitAssignName(DeviceInit, &DeviceName);
+    if (!NT_SUCCESS(Status)) return Status;
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attributes, SWBAT_DEVICE);
     Status = WdfDeviceCreate(&DeviceInit, &Attributes, &Device);
@@ -1019,8 +1144,22 @@ NTSTATUS SwBatEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     if (!NT_SUCCESS(Status)) {
         return Status;
     }
+    Status = WdfWaitLockCreate(&Attributes, &Dev->ClassLock);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+    Status = WdfDeviceCreateSymbolicLink(Device, &LinkName);
+    SwBatTrace(L"SymbolicLinkStatus", (ULONG)Status);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
 
-    return WdfWaitLockCreate(&Attributes, &Dev->ClassLock);
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&QueueConfig, WdfIoQueueDispatchSequential);
+    QueueConfig.PowerManaged = WdfFalse;
+    QueueConfig.EvtIoDeviceControl = SwBatEvtIoDeviceControl;
+    WDF_OBJECT_ATTRIBUTES_INIT(&Attributes);
+    Attributes.ExecutionLevel = WdfExecutionLevelPassive;
+    return WdfIoQueueCreate(Device, &QueueConfig, &Attributes, WDF_NO_HANDLE);
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
@@ -1032,7 +1171,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBatParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBatParamsPath);
     }
-    SwBatTrace(L"DriverVersion", 11);
+    SwBatTrace(L"DriverVersion", 12);
 
     WDF_DRIVER_CONFIG_INIT(&Config, SwBatEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
