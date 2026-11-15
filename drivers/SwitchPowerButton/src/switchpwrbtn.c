@@ -19,6 +19,8 @@
 #include <spb.h>
 #include <vhf.h>
 #include "button_state.h"
+#include "core_voltage.h"
+#include "core_voltage_control.h"
 
 #define MAX77620_ONOFFIRQ    0x0B
 #define MAX77620_ONOFFSTAT   0x15
@@ -53,6 +55,7 @@ typedef struct _SWPWR_DEVICE {
     LONG Presses;
     LONG Reports;
     LONG WakeReports, PowerReports;
+    struct sw_core_voltage CoreVoltage;
 } SWPWR_DEVICE, *PSWPWR_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(SWPWR_DEVICE, SwPwrGetDevice)
 
@@ -138,6 +141,66 @@ static NTSTATUS SwPwrReadReg(WDFIOTARGET Target, UCHAR Register, PUCHAR Value)
         Status = STATUS_DEVICE_PROTOCOL_ERROR;
     }
     return Status;
+}
+
+static bool SwCoreRead(void *context, uint8_t *value)
+{
+    PSWPWR_DEVICE Dev = context;
+    return NT_SUCCESS(SwPwrReadReg(Dev->I2c, 0x16u, value));
+}
+static bool SwCoreWrite(void *context, uint8_t value)
+{
+    PSWPWR_DEVICE Dev = context;
+    UCHAR bytes[2] = {0x16u, value};
+    WDF_MEMORY_DESCRIPTOR memory;
+    WDF_REQUEST_SEND_OPTIONS options;
+    ULONG_PTR written = 0;
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&memory, bytes, sizeof(bytes));
+    WDF_REQUEST_SEND_OPTIONS_INIT(&options, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    options.Timeout = WDF_REL_TIMEOUT_IN_MS(200);
+    NTSTATUS status = WdfIoTargetSendWriteSynchronously(Dev->I2c, NULL,
+        &memory, NULL, &options, &written);
+    return NT_SUCCESS(status) && written == sizeof(bytes);
+}
+static void SwCoreSettle(void *context)
+{
+    LARGE_INTEGER delay;
+    UNREFERENCED_PARAMETER(context);
+    delay.QuadPart = -10000; /* 1 ms after verified SD0 VOUT programming */
+    (VOID)KeDelayExecutionThread(KernelMode, FALSE, &delay);
+}
+static VOID SwPwrCoreControl(WDFQUEUE Queue, WDFREQUEST Request,
+                              size_t OutLength, size_t InLength, ULONG Code)
+{
+    PSWPWR_DEVICE Dev = SwPwrGetDevice(WdfIoQueueGetDevice(Queue));
+    SWCORE_VOTE *in, *out, value;
+    NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
+    UNREFERENCED_PARAMETER(OutLength); UNREFERENCED_PARAMETER(InLength);
+    if (WdfRequestGetRequestorMode(Request) != KernelMode) status = STATUS_ACCESS_DENIED;
+    else if (Code == IOCTL_SWCORE_EMC_VOTE) {
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(value), (PVOID *)&in, NULL);
+        if (NT_SUCCESS(status)) {
+            value = *in;
+            status = WdfRequestRetrieveOutputBuffer(Request, sizeof(value), (PVOID *)&out, NULL);
+            if (NT_SUCCESS(status)) {
+                if (Dev->Stopping || !Dev->I2c) status = STATUS_DEVICE_NOT_READY;
+                else if (value.Version != SWCORE_VOTE_VERSION || value.SetVote > 1u ||
+                    (value.SetVote && value.MinimumUv &&
+                     (value.MinimumUv < 600000u || value.MinimumUv > 1050000u)))
+                    status = STATUS_INVALID_PARAMETER;
+                else {
+                    const struct sw_core_io io = {Dev, SwCoreRead, SwCoreWrite, SwCoreSettle};
+                    status = sw_core_voltage_vote(&Dev->CoreVoltage, &io,
+                        value.SetVote != 0, value.MinimumUv) ? STATUS_SUCCESS : STATUS_DEVICE_HARDWARE_ERROR;
+                    value.AppliedUv = Dev->CoreVoltage.applied_uv;
+                    value.BootFloorUv = Dev->CoreVoltage.boot_uv;
+                    value.VoteUv = Dev->CoreVoltage.vote_uv;
+                    *out = value;
+                }
+            }
+        }
+    }
+    WdfRequestCompleteWithInformation(Request, status, NT_SUCCESS(status) ? sizeof(value) : 0);
 }
 
 /* ---------------------------------------------------------------- button */
@@ -254,7 +317,7 @@ NTSTATUS SwPwrEvtSelfManagedIoInit(WDFDEVICE Device)
         Config.VhfClientContext = Dev;
         Config.VendorID = 0x057E;       /* Nintendo */
         Config.ProductID = 0x5601;
-        Config.VersionNumber = 0x0004;
+        Config.VersionNumber = 0x0007;
         Status = VhfCreate(&Config, &Dev->Vhf);
         SwPwrTrace(L"VhfCreateStatus", (ULONG)Status);
         if (!NT_SUCCESS(Status)) {
@@ -350,6 +413,8 @@ NTSTATUS SwPwrEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     WDF_PNPPOWER_EVENT_CALLBACKS Pnp;
     WDF_OBJECT_ATTRIBUTES Attributes;
     WDFDEVICE Device;
+    WDF_IO_QUEUE_CONFIG Queue;
+    DECLARE_CONST_UNICODE_STRING(CoreName, SWCORE_DEVICE_NAME);
     NTSTATUS Status;
     UNREFERENCED_PARAMETER(Driver);
 
@@ -360,12 +425,19 @@ NTSTATUS SwPwrEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     Pnp.EvtDeviceSelfManagedIoSuspend = SwPwrEvtSuspend;
     Pnp.EvtDeviceSelfManagedIoRestart = SwPwrEvtRestart;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &Pnp);
+    Status = WdfDeviceInitAssignName(DeviceInit, &CoreName);
+    if (!NT_SUCCESS(Status)) return Status;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attributes, SWPWR_DEVICE);
     Status=WdfDeviceCreate(&DeviceInit,&Attributes,&Device);
     if (NT_SUCCESS(Status)) {
         PSWPWR_DEVICE Dev=SwPwrGetDevice(Device);
         KeInitializeSpinLock(&Dev->TimerLock);
         Dev->Stopping=TRUE;
+        WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&Queue, WdfIoQueueDispatchSequential);
+        Queue.EvtIoDeviceControl = SwPwrCoreControl;
+        WDF_OBJECT_ATTRIBUTES_INIT(&Attributes);
+        Attributes.ExecutionLevel = WdfExecutionLevelPassive;
+        Status = WdfIoQueueCreate(Device, &Queue, &Attributes, WDF_NO_HANDLE);
     }
     return Status;
 }
@@ -379,7 +451,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwPwrParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwPwrParamsPath);
     }
-    SwPwrTrace(L"DriverVersion", 4);
+    SwPwrTrace(L"DriverVersion", 7);
     WDF_DRIVER_CONFIG_INIT(&Config, SwPwrEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }

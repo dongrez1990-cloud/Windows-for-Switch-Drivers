@@ -10,7 +10,7 @@ out=${2:?output directory}
 sdk=${SDK_INCLUDE:-$WDK_INCLUDE}
 extra=${WDK_EXTRA_LIB:-$WDK_LIB}
 cc=${CLANG_CL:-clang-cl}; ld=${LLD_LINK:-lld-link}
-for pair in Tegra210Gpio:tegra210gpio Tegra210I2c:tegra210i2c SwitchLiteTouch:switchtouch SwitchPowerButton:switchpwrbtn SwitchFan:switchfan SwitchBattery:switchbattery SwitchRtc:switchrtc SwitchBluetooth:switchbt SwitchSensor:switchsio TegraXusb:tegraxusb; do
+for pair in ${SWITCH_DRIVER_LIST:-Tegra210Gpio:tegra210gpio Tegra210I2c:tegra210i2c SwitchLiteTouch:switchtouch SwitchPowerButton:switchpwrbtn SwitchFan:switchfan SwitchBattery:switchbattery SwitchRtc:switchrtc SwitchBluetooth:switchbt SwitchSensor:switchsio TegraXusb:tegraxusb}; do
     dir=${pair%:*}; name=${pair#*:}; dest="$out/$name"
     driver_dir="$src/drivers/$dir"
     mkdir -p "$dest"

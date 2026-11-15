@@ -11,6 +11,8 @@
 #ifdef SWITCH_LITE_GPU
 #include "power_ioctl.h"
 #include "t214/dfll_windows_types.h"
+#include "t214/emc_windows_types.h"
+#include "integration/switch-lite/windows/SwitchFan/src/t214/emc_gpu_vote.h"
 #endif
 
 #define PWM_CSR_0        0x00
@@ -34,6 +36,7 @@ typedef struct _SWBL_STATUS {
 #define PWM_ABSOLUTE_OFF (0x100u << 16)
 #define TMP451_LOCAL     0x00
 #define TMP451_REMOTE    0x01
+#include "fan_profile.h"
 #define POLL_MS          2000
 #define FAILSAFE_DUTY    153u
 
@@ -64,6 +67,9 @@ typedef struct _SWFAN_DEVICE {
     ULONG GpuReportedKhz, GpuReportedUv, GpuStatusWord;
 #ifdef SWITCH_LITE_GPU
     SWFAN_DFLL Dfll;
+    SWFAN_EMC Emc;
+    struct tg_emc_gpu_vote EmcGpuVote;
+    ULONGLONG EmcGpuAbiTime;
     ULONGLONG GpuSampleTime;
     ULONGLONG GpuAbiTime;
     ULONGLONG TempSampleTime;
@@ -72,8 +78,19 @@ typedef struct _SWFAN_DEVICE {
     LARGE_INTEGER SensorId;
     WDFIOTARGET Sensor;
     WDFTIMER Timer;
-    volatile BOOLEAN Stopping;
+#ifdef SWITCH_LITE_GPU
+    WDFTIMER EmcTimer;
+    WDFWAITLOCK EmcLock;
+    WDFDPC EmcDpc;
+    WDFWORKITEM EmcWorkItem;
+#endif
+    KSPIN_LOCK TimerLock;
+    volatile BOOLEAN Stopping, TimerStopping;
     ULONG Duty;
+    WDFWAITLOCK FanLock;
+    ULONG FanProfile, FanTargetPwm, FanProfileFlags;
+    ULONGLONG FanSampleTime;
+    struct sw_fan_filter FanFilter;
     ULONG Failures;
     ULONG LastTemp;
     BOOLEAN TempValid;
@@ -207,12 +224,14 @@ static VOID SwFanSetDuty(PSWFAN_DEVICE Dev, ULONG Duty);
 #define SWFAN_HAVE_DFLL 1
 static ULONG SwFanDfllReadKhz(PSWFAN_DEVICE Dev);
 static NTSTATUS SwFanDfllStopLocked(PSWFAN_DEVICE Dev);
+static VOID SwFanEmcCpuRateChanged(PSWFAN_DEVICE Dev, ULONG Khz);
 static NTSTATUS SwFanDvfsUpdateLocked(PSWFAN_DEVICE Dev, ULONG Temp, BOOLEAN Valid);
 #endif
 #include "t214/clock.h"
 #ifdef SWITCH_LITE_GPU
 #include "t214/dfll_windows.h"
 #include "t214/gpu_pmic.h"
+#include "t214/emc_windows.h"
 #endif
 
 /* ------------------------------------------------------------------- fan */
@@ -247,7 +266,7 @@ VOID SwFanEvtTimer(WDFTIMER Timer)
     BOOLEAN ScreenOff, ClockRestored;
     ULONG DisplayState, BacklightDuty;
 
-    if (Dev->Stopping) return;
+    if (Dev->Stopping || Dev->TimerStopping) return;
     WdfWaitLockAcquire(Dev->BacklightLock, NULL);
     ScreenOff = Dev->IsLite && Dev->BacklightReady && Dev->DisplayState == 0;
     DisplayState = Dev->DisplayState;
@@ -284,12 +303,20 @@ VOID SwFanEvtTimer(WDFTIMER Timer)
 #endif
         SwFanCpuUnlock(Dev);
         Dev->Failures = 0;
+        WdfWaitLockAcquire(Dev->FanLock, NULL);
         ULONG Duty = SwFanDutyForTemp(Temp, Dev->Duty);
+        if (Dev->IsLite) {
+            Dev->FanTargetPwm=sw_fan_profile_sample(&Dev->FanFilter,Dev->FanProfile,(int32_t)Temp*1000,1);
+            Dev->FanProfileFlags=SWFAN_PROFILE_VALID | (Temp>=80 ? SWFAN_PROFILE_FAILSAFE : 0);
+            Dev->FanSampleTime=KeQueryInterruptTime();
+            Duty=sw_fan_pwm_duty(Dev->FanTargetPwm);
+        }
         // Retain the overclock floor until stock CPU clock is confirmed. On
         // wake, restore cooling before SwCpuTemperature can reapply overclock.
         if (Dev->IsLite && Dev->Config.CpuKhz == LITE_CPU_KHZ &&
             ((!ScreenOff && Dev->CpuOverclockEnabled) || !ClockRestored) && Duty < 51) Duty = 51;
         SwFanSetDuty(Dev, Duty);
+        WdfWaitLockRelease(Dev->FanLock);
         if (!ScreenOff) SwCpuTemperature(Dev, Temp, TRUE);
         SwFanTrace(L"TempSoC", Remote);
         SwFanTrace(L"TempBoard", Local);
@@ -299,8 +326,14 @@ VOID SwFanEvtTimer(WDFTIMER Timer)
         SwFanCpuUnlock(Dev);
         SwFanTrace(L"LastSensorError", (ULONG)Status);
         /* A stopped fan needs cooling on the first lost temperature sample. */
-        if (++Dev->Failures >= 3 || Dev->Duty == 0) {
-            SwFanSetDuty(Dev, FAILSAFE_DUTY);
+        WdfWaitLockAcquire(Dev->FanLock, NULL);
+        Dev->FanProfileFlags=SWFAN_PROFILE_FAILSAFE;
+        Dev->FanTargetPwm=255;
+        Dev->FanFilter.initialized=0;
+        const BOOLEAN FailCooling=++Dev->Failures >= 3 || Dev->Duty == 0;
+        if (FailCooling || Dev->IsLite) SwFanSetDuty(Dev, Dev->IsLite ? PWM_DUTY_MAX : FAILSAFE_DUTY);
+        WdfWaitLockRelease(Dev->FanLock);
+        if (FailCooling) {
             SwCpuTemperature(Dev, 0, FALSE);
         }
     }
@@ -310,8 +343,11 @@ VOID SwFanEvtTimer(WDFTIMER Timer)
     if (Dev->Car != NULL) SwFanTrace(L"CpuActualKhz", SwCpuKhz(Dev));
     SwFanCpuUnlock(Dev);
     SwFanTrace(L"Runs", (ULONG)InterlockedIncrement(&Dev->Runs));
-    if (!Dev->Stopping) {
-        WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_MS(POLL_MS));    /* one-shot passive timer, re-armed */
+    {
+        KIRQL irql;
+        KeAcquireSpinLock(&Dev->TimerLock, &irql);
+        if (!Dev->Stopping && !Dev->TimerStopping) WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_MS(POLL_MS));
+        KeReleaseSpinLock(&Dev->TimerLock, irql);
     }
 }
 
@@ -370,7 +406,54 @@ VOID SwFanEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLengt
     UNREFERENCED_PARAMETER(OutLength);
     UNREFERENCED_PARAMETER(InLength);
 
+    if (Code == IOCTL_SWFAN_GET_FAN_PROFILE || Code == IOCTL_SWFAN_SET_FAN_PROFILE) {
+        if (!Dev->IsLite || !Dev->Pwm || Dev->Stopping || Dev->TimerStopping) {
+            WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
+            return;
+        }
+        if (Code == IOCTL_SWFAN_SET_FAN_PROFILE) {
+            SWFAN_PROFILE_REQUEST *In;
+            Status=WdfRequestRetrieveInputBuffer(Request,sizeof(*In),(PVOID *)&In,NULL);
+            if (NT_SUCCESS(Status)) {
+                if (In->Version!=SWFAN_PROFILE_VERSION) Status=STATUS_REVISION_MISMATCH;
+                else if (In->Mode>=SwFanProfileCount) Status=STATUS_INVALID_PARAMETER;
+                else {
+                    WdfWaitLockAcquire(Dev->FanLock,NULL);
+                    Dev->FanProfile=In->Mode;
+                    WdfWaitLockRelease(Dev->FanLock);
+                }
+            }
+        } else {
+            SWFAN_PROFILE_STATUS *Out;
+            Status=WdfRequestRetrieveOutputBuffer(Request,sizeof(*Out),(PVOID *)&Out,NULL);
+            if (NT_SUCCESS(Status)) {
+                WdfWaitLockAcquire(Dev->FanLock,NULL);
+                RtlZeroMemory(Out,sizeof(*Out));
+                Out->Version=SWFAN_PROFILE_VERSION; Out->Mode=Dev->FanProfile;
+                Out->Duty=Dev->Duty; Out->TargetPwm=Dev->FanTargetPwm;
+                Out->Flags=Dev->FanProfileFlags; Out->FilteredTempMc=Dev->FanFilter.lta;
+                ULONGLONG age=Dev->FanSampleTime ?
+                    (KeQueryInterruptTime()-Dev->FanSampleTime)/10000u : MAXULONG;
+                Out->SampleAgeMs=age>MAXULONG ? MAXULONG : (ULONG)age;
+                WdfWaitLockRelease(Dev->FanLock);
+                Info=sizeof(*Out);
+            }
+        }
+        WdfRequestCompleteWithInformation(Request,Status,Info);
+        return;
+    }
+
 #ifdef SWITCH_LITE_GPU
+    if (Code == IOCTL_SWFAN_GET_EMC_STATUS) {
+        SWFAN_EMC_STATUS *Out;
+        Status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*Out), (PVOID *)&Out, NULL);
+        if (NT_SUCCESS(Status)) {
+            SwFanGetEmcStatus(Dev, Out);
+            Info = sizeof(*Out);
+        }
+        WdfRequestCompleteWithInformation(Request, Status, Info);
+        return;
+    }
     if (Code == TG_GPU_IOCTL_PMIC) {
         Status = SwFanGpuPmic(Dev, Request, &Info);
         WdfRequestCompleteWithInformation(Request, Status, Info);
@@ -457,6 +540,8 @@ NTSTATUS SwFanEvtD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState)
     PSWFAN_DEVICE Dev = SwFanGetDevice(Device);
     UNREFERENCED_PARAMETER(PreviousState);
     Dev->TempValid = FALSE;
+    Dev->FanProfileFlags = 0;
+    Dev->FanFilter.initialized = 0;
     /* Cooling resumes before the passive timer can restore CPU overclock. */
     if (Dev->IsLite && Dev->Pwm != NULL) SwFanSetDuty(Dev, 76);
     SwFanTrace(L"SleepFanOff", 0);
@@ -487,6 +572,10 @@ NTSTATUS SwFanEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
     ULONG Count = WdfCmResourceListGetCount(Translated), Index;
     BOOLEAN HaveSensor = FALSE;
     Dev->ConnectionCount = 0;
+#ifdef SWITCH_LITE_GPU
+    Dev->Emc.MailResources = 0;
+    PCM_PARTIAL_RESOURCE_DESCRIPTOR actmonRaw=NULL,actmonTranslated=NULL;
+#endif
     UNREFERENCED_PARAMETER(Raw);
 
     for (Index = 0; Index < Count; ++Index) {
@@ -494,6 +583,20 @@ NTSTATUS SwFanEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
         if (Desc == NULL) {
             continue;
         }
+#ifdef SWITCH_LITE_GPU
+        if (Desc->Type==CmResourceTypeInterrupt) {
+            PCM_PARTIAL_RESOURCE_DESCRIPTOR raw=WdfCmResourceListGetDescriptor(Raw,Index);
+            /* T210 DT SPI45 is GIC INTID/ACPI GSIV77 (32 SPI base +45).
+             * Use PnP's translated vector, never pass the raw number to HAL. */
+            if (actmonRaw || !raw || raw->Type!=CmResourceTypeInterrupt ||
+                raw->u.Interrupt.Vector!=77u ||
+                (raw->Flags&(CM_RESOURCE_INTERRUPT_LATCHED|CM_RESOURCE_INTERRUPT_MESSAGE)) ||
+                (Desc->Flags&(CM_RESOURCE_INTERRUPT_LATCHED|CM_RESOURCE_INTERRUPT_MESSAGE)))
+                return STATUS_DEVICE_CONFIGURATION_ERROR;
+            actmonRaw=raw;actmonTranslated=Desc;
+            continue;
+        }
+#endif
         if (Desc->Type == CmResourceTypeMemory) {
             if (Desc->u.Memory.Start.QuadPart == 0x7000A010 && Desc->u.Memory.Length == sizeof(ULONG)) {
                 Dev->Pwm = (volatile UCHAR *)MmMapIoSpaceEx(Desc->u.Memory.Start, sizeof(ULONG), PAGE_READWRITE | PAGE_NOCACHE);
@@ -521,12 +624,64 @@ NTSTATUS SwFanEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
 #ifdef SWITCH_LITE_GPU
                 for (I = 0; I < sizeof(Dev->Dfll.Handoff)/sizeof(ULONG); ++I)
                     ((PULONG)&Dev->Dfll.Handoff)[I] = READ_REGISTER_ULONG((PULONG)&Map[0x100/4 + I]);
+                for (I = 0; I < sizeof(Dev->Emc.Handoff)/sizeof(ULONG); ++I)
+                    ((PULONG)&Dev->Emc.Handoff)[I] = READ_REGISTER_ULONG((PULONG)&Map[0x200/4 + I]);
 #endif
                 MmUnmapIoSpace((PVOID)Map, 0x1000);
                 if (Dev->Config.Magic != LITE_PERF_MAGIC || Dev->Config.Version != LITE_PERF_VERSION)
                     RtlZeroMemory(&Dev->Config, sizeof(Dev->Config));
             }
 #ifdef SWITCH_LITE_GPU
+            if (Desc->u.Memory.Start.QuadPart == 0x60001000 && Desc->u.Memory.Length == 12) {
+                Dev->Emc.Semaphore = (volatile UCHAR *)MmMapIoSpaceEx(Desc->u.Memory.Start, 12, PAGE_READWRITE | PAGE_NOCACHE);
+                if (!Dev->Emc.Semaphore) return STATUS_INSUFFICIENT_RESOURCES;
+            } else if (Desc->u.Memory.Start.QuadPart == 0x60004018 && Desc->u.Memory.Length == 4) {
+                Dev->Emc.Doorbell = (volatile UCHAR *)MmMapIoSpaceEx(Desc->u.Memory.Start, 4, PAGE_READWRITE | PAGE_NOCACHE);
+                if (!Dev->Emc.Doorbell) return STATUS_INSUFFICIENT_RESOURCES;
+            } else if (Desc->u.Memory.Start.QuadPart == LITE_EMC_MAIL_BASE && Desc->u.Memory.Length == LITE_EMC_MAIL_SIZE) {
+                Dev->Emc.MailResources |= LITE_EMC_REGION_DRAM;
+            } else if (Desc->u.Memory.Start.QuadPart == LITE_EMC_IRAM_BASE && Desc->u.Memory.Length == LITE_EMC_IRAM_SIZE) {
+                Dev->Emc.MailResources |= LITE_EMC_REGION_IRAM;
+            }
+            for (ULONG I=0;I<SwActmonMapCount;++I) {
+                const UINT64 base=(UINT64)Desc->u.Memory.Start.QuadPart;
+                const UINT64 address=SwActmonResources[I].address;
+                const ULONG length=SwActmonResources[I].length;
+                /* V-bank gate status (0x360) is already authorized within
+                 * the DFLL status resource (0x35c, 12 bytes). Map just its
+                 * register, with its own balanced mapping lifetime. */
+                if (!Dev->Emc.ActmonMap[I] && base<=address &&
+                    address-base<=Desc->u.Memory.Length &&
+                    length<=Desc->u.Memory.Length-(address-base)) {
+                    PHYSICAL_ADDRESS start; start.QuadPart=(LONGLONG)address;
+                    Dev->Emc.ActmonMap[I]=(volatile UCHAR *)MmMapIoSpaceEx(start,length,
+                        (SwActmonResources[I].read_only?PAGE_READONLY:PAGE_READWRITE)|PAGE_NOCACHE);
+                    if (!Dev->Emc.ActmonMap[I]) return STATUS_INSUFFICIENT_RESOURCES;
+                }
+            }
+            for (ULONG I=0;I<SwQosRegisterCount;++I) {
+                if (Desc->u.Memory.Start.QuadPart==SwEmcQosResources[I] && Desc->u.Memory.Length==4) {
+                    if (Dev->Emc.QosMap[I]) return STATUS_DEVICE_CONFIGURATION_ERROR;
+                    if (I<=SwQosRingMax && (Desc->Flags&CM_RESOURCE_MEMORY_READ_ONLY)) break;
+                    Dev->Emc.QosMap[I]=(volatile ULONG *)MmMapIoSpaceEx(Desc->u.Memory.Start,4,
+                        (I<=SwQosRingMax?PAGE_READWRITE:PAGE_READONLY)|PAGE_NOCACHE);
+                    if (!Dev->Emc.QosMap[I]) return STATUS_INSUFFICIENT_RESOURCES;
+                    break;
+                }
+            }
+            for (ULONG I=0;I<SW_EMC_PTSA_RESOURCE_COUNT;++I) {
+                if (Desc->u.Memory.Start.QuadPart!=0x70019000u+sw_emc_ptsa_resources[I].offset ||
+                    Desc->u.Memory.Length!=4) continue;
+                /* A read-only legacy CRS is not authorization to initialize MC.
+                 * Missing/wrong permissions keep SET_RATE gated in bootstrap. */
+                if (Dev->Emc.PtsaMap[I]) return STATUS_DEVICE_CONFIGURATION_ERROR;
+                if (sw_emc_ptsa_resources[I].writable && (Desc->Flags&CM_RESOURCE_MEMORY_READ_ONLY))
+                    continue;
+                Dev->Emc.PtsaMap[I]=(volatile ULONG *)MmMapIoSpaceEx(Desc->u.Memory.Start,4,
+                    (sw_emc_ptsa_resources[I].writable?PAGE_READWRITE:PAGE_READONLY)|PAGE_NOCACHE);
+                if (!Dev->Emc.PtsaMap[I]) return STATUS_INSUFFICIENT_RESOURCES;
+                break;
+            }
             for (ULONG I = 0; I < SwDfllResourceCount; ++I) {
                 if (Desc->u.Memory.Start.QuadPart == SwDfllResources[I].Address &&
                     Desc->u.Memory.Length == SwDfllResources[I].Length) {
@@ -552,6 +707,28 @@ NTSTATUS SwFanEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
     if (Dev->Pwm == NULL || !HaveSensor) {
         return STATUS_DEVICE_CONFIGURATION_ERROR;
     }
+#ifdef SWITCH_LITE_GPU
+    /* Resource order is not an ABI. Map the mailbox only after both its
+     * reserved range and the complete firmware handoff have been collected. */
+    if (LiteEmcHandoffValid(&Dev->Emc.Handoff) &&
+        (Dev->Emc.MailResources & LiteEmcMailRegion(Dev->Emc.Handoff.MailAddress))) {
+        PHYSICAL_ADDRESS address;
+        address.QuadPart = Dev->Emc.Handoff.MailAddress;
+        Dev->Emc.Mail = (volatile UCHAR *)MmMapIoSpaceEx(address, 128, PAGE_READWRITE | PAGE_NOCACHE);
+        if (!Dev->Emc.Mail) return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    if (actmonRaw && Dev->IsLite) {
+        WDF_INTERRUPT_CONFIG config;
+        WDF_INTERRUPT_CONFIG_INIT(&config,SwFanEmcIsr,NULL);
+        config.AutomaticSerialization=FALSE;
+        config.InterruptRaw=actmonRaw;config.InterruptTranslated=actmonTranslated;
+        config.EvtInterruptEnable=SwFanEmcInterruptEnable;
+        config.EvtInterruptDisable=SwFanEmcInterruptDisable;
+        config.ReportInactiveOnPowerDown=WdfFalse;
+        NTSTATUS status=WdfInterruptCreate(Device,&config,WDF_NO_OBJECT_ATTRIBUTES,&Dev->Emc.Interrupt);
+        if (!NT_SUCCESS(status)) return status;
+    }
+#endif
     if (!Dev->IsLite) Dev->BacklightPwm = Dev->Pwm;
     /* Read once per hardware start so a diagnostic does not introduce another
        live clock transition. Zero keeps the inherited CPU clock across lock. */
@@ -559,6 +736,9 @@ NTSTATUS SwFanEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
     Dev->BaseCpuOverclockEnabled = Dev->CpuOverclockEnabled;
     Dev->PowerMode = 7; /* separate Windows recovery baseline; never auto-select OC */
     Dev->PolicySeq = 0;
+    Dev->FanProfile = SwFanProfileHandheld;
+    RtlZeroMemory(&Dev->FanFilter,sizeof(Dev->FanFilter));
+    Dev->FanProfileFlags=0; Dev->FanSampleTime=0;
 #ifdef SWITCH_LITE_GPU
     (VOID)InterlockedExchange(&Dev->GpuDvfsPolicy, (LONG)TG_GPU_DVFS_POLICY_PACK(0, 460800u, 460800u, 0));
 #endif
@@ -574,6 +754,23 @@ NTSTATUS SwFanEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
     SwFanTrace(L"CoreMv", Dev->Config.CoreMv);
     SwFanTrace(L"BpmpError", Dev->Config.BpmpError);
     SwFanTrace(L"BpmpChannel", Dev->Config.BpmpChannel);
+#ifdef SWITCH_LITE_GPU
+    /* Publish the already-read startup contract once, so missing firmware
+       handoff is distinguishable from an unassigned ACPI resource or a busy
+       mailbox. This does not send a BPMP request or change channel tokens. */
+    SwFanTrace(L"EmcHandoffMagic", Dev->Emc.Handoff.Magic);
+    SwFanTrace(L"EmcHandoffVersion", Dev->Emc.Handoff.Version);
+    SwFanTrace(L"EmcHandoffValid", LiteEmcHandoffValid(&Dev->Emc.Handoff));
+    SwFanTrace(L"EmcHandoffChannel", Dev->Emc.Handoff.Channel);
+    SwFanTrace(L"EmcHandoffMail", Dev->Emc.Handoff.MailAddress);
+    SwFanTrace(L"EmcHandoffGpuSpeedo", Dev->Emc.Handoff.GpuSpeedo);
+    SwFanTrace(L"EmcHandoffSocSpeedo", Dev->Emc.Handoff.SocSpeedo);
+    SwFanTrace(L"EmcResourceMask", Dev->Emc.MailResources |
+        (Dev->Emc.Semaphore ? 4u : 0u) | (Dev->Emc.Doorbell ? 8u : 0u) |
+        (Dev->Emc.Mail ? 16u : 0u));
+    SwFanTrace(L"EmcTokenAtStart", Dev->Emc.Semaphore ?
+        READ_REGISTER_ULONG((PULONG)Dev->Emc.Semaphore) : MAXULONG);
+#endif
     SwFanTrace(L"CsrAtStart", READ_REGISTER_ULONG((PULONG)(Dev->Pwm + Dev->FanOffset)));
     return STATUS_SUCCESS;
 }
@@ -608,6 +805,20 @@ NTSTATUS SwFanEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
     }
     if (Dev->Car != NULL) { MmUnmapIoSpace((PVOID)Dev->Car, 0x100); Dev->Car = NULL; }
 #ifdef SWITCH_LITE_GPU
+    /* Power-down has disconnected this IRQ; queued DPC/work was joined by
+     * Suspend. Delete before zeroing its state or unmapping its MMIO. */
+    if (Dev->Emc.Interrupt) WdfObjectDelete(Dev->Emc.Interrupt);
+    if (Dev->Emc.CoreTarget) { WdfIoTargetClose(Dev->Emc.CoreTarget); WdfObjectDelete(Dev->Emc.CoreTarget); }
+    if (Dev->Emc.Mail) MmUnmapIoSpace((PVOID)Dev->Emc.Mail, 128);
+    if (Dev->Emc.Doorbell) MmUnmapIoSpace((PVOID)Dev->Emc.Doorbell, 4);
+    if (Dev->Emc.Semaphore) MmUnmapIoSpace((PVOID)Dev->Emc.Semaphore, 12);
+    for (ULONG I=0;I<SwActmonMapCount;++I)
+        if (Dev->Emc.ActmonMap[I]) MmUnmapIoSpace((PVOID)Dev->Emc.ActmonMap[I],SwActmonResources[I].length);
+    for (ULONG I=0;I<SwQosRegisterCount;++I)
+        if (Dev->Emc.QosMap[I]) MmUnmapIoSpace((PVOID)Dev->Emc.QosMap[I],4);
+    for (ULONG I=0;I<SW_EMC_PTSA_RESOURCE_COUNT;++I)
+        if (Dev->Emc.PtsaMap[I]) MmUnmapIoSpace((PVOID)Dev->Emc.PtsaMap[I],4);
+    RtlZeroMemory(&Dev->Emc, sizeof(Dev->Emc));
     for (ULONG I = 0; I < SwDfllResourceCount; ++I) {
         if (Dev->Dfll.Map[I]) MmUnmapIoSpace((PVOID)Dev->Dfll.Map[I], SwDfllResources[I].Length);
         Dev->Dfll.Map[I] = NULL;
@@ -677,6 +888,18 @@ NTSTATUS SwFanEvtSelfManagedIoInit(WDFDEVICE Device)
         }
         SwFanGetTimer(Dev->Timer)->Device = Device;
     }
+#ifdef SWITCH_LITE_GPU
+    if (Dev->IsLite && !Dev->EmcTimer) {
+        WDF_TIMER_CONFIG config;
+        WDF_OBJECT_ATTRIBUTES attributes;
+        WDF_TIMER_CONFIG_INIT(&config,SwFanEvtEmcTimer);
+        config.AutomaticSerialization=FALSE;
+        WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+        attributes.ParentObject=Device; attributes.ExecutionLevel=WdfExecutionLevelPassive;
+        Status=WdfTimerCreate(&config,&attributes,&Dev->EmcTimer);
+        if (!NT_SUCCESS(Status)) return Status;
+    }
+#endif
     return SwFanEvtRestart(Device);
 }
 
@@ -684,9 +907,45 @@ NTSTATUS SwFanEvtSuspend(WDFDEVICE Device)
 {
     PSWFAN_DEVICE Dev = SwFanGetDevice(Device);
     NTSTATUS Status;
-    Dev->Stopping = TRUE;
+    KIRQL irql;
+    KeAcquireSpinLock(&Dev->TimerLock, &irql);
+    Dev->TimerStopping = TRUE;
+    KeReleaseSpinLock(&Dev->TimerLock, irql);
+#ifdef SWITCH_LITE_GPU
+    SW_EMC_IRQ_REQUEST mask={.Operation=SwEmcIrqMask};
+    if (Dev->Emc.Interrupt) (VOID)SwEmcIrqRequest(&Dev->Emc,&mask);
+#endif
     if (Dev->Timer != NULL) WdfTimerStop(Dev->Timer, TRUE);
+#ifdef SWITCH_LITE_GPU
+    if (Dev->EmcTimer) WdfTimerStop(Dev->EmcTimer,TRUE);
+    if (Dev->EmcDpc) (VOID)WdfDpcCancel(Dev->EmcDpc,TRUE);
+    if (Dev->EmcWorkItem) WdfWorkItemFlush(Dev->EmcWorkItem);
+    WdfWaitLockAcquire(Dev->EmcLock,NULL);
+    if (Dev->Emc.Active) {
+        Dev->Emc.StopStatus = SwFanEmcStopLoad(Dev);
+        Dev->Emc.Active = FALSE;
+    }
+    NTSTATUS emcStatus = Dev->Emc.StopStatus;
+    WdfWaitLockRelease(Dev->EmcLock);
+    KeAcquireSpinLock(&Dev->TimerLock, &irql);
+    Dev->Stopping = TRUE;
+    KeReleaseSpinLock(&Dev->TimerLock, irql);
+    SwFanCpuLock(Dev);
+    Dev->Emc.CpuFloorInitialized = FALSE;
+    Dev->Emc.FloorsInitialized = FALSE;
+    Dev->Emc.SampleTime = 0;
+    Dev->Emc.Published.ActualKhz = 0;
+    Dev->Emc.Published.Flags &= ~SWFAN_EMC_RATE_VALID;
+    SwFanCpuUnlock(Dev);
+#else
+    KeAcquireSpinLock(&Dev->TimerLock, &irql);
+    Dev->Stopping = TRUE;
+    KeReleaseSpinLock(&Dev->TimerLock, irql);
+#endif
     Status = SwCpuApply(Dev, FALSE);
+#ifdef SWITCH_LITE_GPU
+    if (NT_SUCCESS(Status) && !NT_SUCCESS(emcStatus)) Status=emcStatus;
+#endif
     if (Dev->Pwm != NULL) SwFanSetDuty(Dev, 76);
     return Status;
 }
@@ -694,6 +953,7 @@ NTSTATUS SwFanEvtSuspend(WDFDEVICE Device)
 NTSTATUS SwFanEvtRestart(WDFDEVICE Device)
 {
     PSWFAN_DEVICE Dev = SwFanGetDevice(Device);
+    KIRQL irql;
     NTSTATUS Status = Dev->IsLite ? SwFanConfigureSensor(Dev->Sensor) : STATUS_SUCCESS;
     SwFanStartBacklight(Device);
     SwFanTrace(L"ConfigureSensorStatus", (ULONG)Status);
@@ -701,10 +961,41 @@ NTSTATUS SwFanEvtRestart(WDFDEVICE Device)
         SwFanSetDuty(Dev, FAILSAFE_DUTY);
         return Status;
     }
-    if (Dev->IsLite) SwCpuPrepare(Device);
-    Dev->Stopping = FALSE;
+    if (Dev->IsLite) {
+#ifdef SWITCH_LITE_GPU
+        /* A driver rebind need not reset DRAM to the firmware's boot rate.
+         * Until BPMP supplies the live rate, retain the CPU floor required
+         * at the characterized 3200-MHz maximum (process0: 620 mV). */
+        if (!Dev->Emc.CpuFloorInitialized)
+            Dev->Dfll.EmcFloorUv=Dev->Dfll.Handoff.CpuProcessId==0u ? 620000u : 600000u;
+        if (!Dev->Emc.FloorsInitialized && LiteEmcHandoffValid(&Dev->Emc.Handoff)) {
+            uint32_t gpu_uv=tg_gpu_emc_floor_policy_uv(Dev->Emc.Handoff.GpuSpeedo,SW_EMC_CHARACTERIZED_MAX_KHZ);
+            if (gpu_uv!=UINT32_MAX) {
+                SwFanPmicLock(Dev);
+                if (!Dev->EmcGpuVote.released) {
+                    Dev->EmcGpuVote.guard_uv=gpu_uv;
+                    (VOID)tg_emc_gpu_request(&Dev->EmcGpuVote,gpu_uv,FALSE);
+                }
+                SwFanPmicUnlock(Dev);
+            }
+        }
+        Dev->Emc.Active = TRUE;
+        Dev->Emc.StopStatus = STATUS_SUCCESS;
+#endif
+        SwCpuPrepare(Device);
+#ifdef SWITCH_LITE_GPU
+        SwFanEmcCpuRateChanged(Dev,Dev->BootCpuKhz);
+#endif
+    }
     Dev->Failures = 0;
+    KeAcquireSpinLock(&Dev->TimerLock, &irql);
+    Dev->Stopping = FALSE;
+    Dev->TimerStopping = FALSE;
     WdfTimerStart(Dev->Timer, WDF_REL_TIMEOUT_IN_MS(500));
+#ifdef SWITCH_LITE_GPU
+    if (Dev->EmcTimer) WdfTimerStart(Dev->EmcTimer,WDF_REL_TIMEOUT_IN_MS(500));
+#endif
+    KeReleaseSpinLock(&Dev->TimerLock, irql);
     return STATUS_SUCCESS;
 }
 
@@ -764,6 +1055,7 @@ NTSTATUS SwFanEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     if (!NT_SUCCESS(Status)) {
         return Status;
     }
+    KeInitializeSpinLock(&SwFanGetDevice(Device)->TimerLock);
     Status = WdfWaitLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &SwFanGetDevice(Device)->BacklightLock);
     if (!NT_SUCCESS(Status)) {
         return Status;
@@ -778,6 +1070,22 @@ NTSTATUS SwFanEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     if (!NT_SUCCESS(Status)) {
         return Status;
     }
+    Status = WdfWaitLockCreate(&Attributes, &SwFanGetDevice(Device)->FanLock);
+    if (!NT_SUCCESS(Status)) return Status;
+#ifdef SWITCH_LITE_GPU
+    Status=WdfWaitLockCreate(&Attributes,&SwFanGetDevice(Device)->EmcLock);
+    if (!NT_SUCCESS(Status)) return Status;
+    WDF_WORKITEM_CONFIG work;
+    WDF_WORKITEM_CONFIG_INIT(&work,SwFanEmcWorkItem);
+    work.AutomaticSerialization=FALSE;
+    Status=WdfWorkItemCreate(&work,&Attributes,&SwFanGetDevice(Device)->EmcWorkItem);
+    if (!NT_SUCCESS(Status)) return Status;
+    WDF_DPC_CONFIG dpc;
+    WDF_DPC_CONFIG_INIT(&dpc,SwFanEmcDpc);
+    dpc.AutomaticSerialization=FALSE;
+    Status=WdfDpcCreate(&dpc,&Attributes,&SwFanGetDevice(Device)->EmcDpc);
+    if (!NT_SUCCESS(Status)) return Status;
+#endif
     Status = WdfDeviceCreateSymbolicLink(Device, &LinkName);
     SwFanTrace(L"SymbolicLinkStatus", (ULONG)Status);
     if (!NT_SUCCESS(Status)) {
@@ -799,7 +1107,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwFanParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwFanParamsPath);
     }
-    SwFanTrace(L"DriverVersion", 19);
+    SwFanTrace(L"DriverVersion", 33);
     WDF_DRIVER_CONFIG_INIT(&Config, SwFanEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }

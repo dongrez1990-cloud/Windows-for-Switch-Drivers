@@ -8,24 +8,29 @@ mingw_bin=${MINGW_BIN:-/Users/rujian/.local/share/mesa-switch-woa-build/toolchai
 
 mkdir -p "$out"
 
+"$mingw_bin/aarch64-w64-mingw32-windres" -I "$src" \
+    -i "$src/SwitchPowerTray.rc" -O coff -o "$out/tray-icon-arm64.o"
+
 "$mingw_bin/aarch64-w64-mingw32-clang" \
     -std=c11 -O2 -Wall -Wextra -Werror -Wno-format-truncation \
     -municode -mwindows \
-    "$src/SwitchPowerTray.c" \
+    "$src/SwitchPowerTray.c" "$out/tray-icon-arm64.o" \
     -luser32 -lshell32 -ladvapi32 -lgdi32 -lole32 -loleaut32 -luuid \
     -o "$out/SwitchPowerTray.exe"
 "$mingw_bin/aarch64-w64-mingw32-strip" "$out/SwitchPowerTray.exe"
 
 if [ "${BUILD_X64:-0}" = "1" ]; then
+    "$mingw_bin/x86_64-w64-mingw32-windres" -I "$src" \
+        -i "$src/SwitchPowerTray.rc" -O coff -o "$out/tray-icon-x64.o"
     "$mingw_bin/x86_64-w64-mingw32-clang" \
         -std=c11 -O2 -Wall -Wextra -Werror -Wno-format-truncation \
         -municode -mwindows \
-        "$src/SwitchPowerTray.c" \
+        "$src/SwitchPowerTray.c" "$out/tray-icon-x64.o" \
         -luser32 -lshell32 -ladvapi32 -lgdi32 -lole32 -loleaut32 -luuid \
         -o "$out/SwitchPowerTray-x64.exe"
     "$mingw_bin/x86_64-w64-mingw32-clang" \
         -std=c11 -O2 -Wall -Wextra -Werror -Wno-format-truncation -municode \
-        "$src/tests/contracts.c" -luser32 -lshell32 -ladvapi32 -lgdi32 -lole32 -loleaut32 -luuid \
+        "$src/tests/contracts.c" "$out/tray-icon-x64.o" -luser32 -lshell32 -ladvapi32 -lgdi32 -lole32 -loleaut32 -luuid \
         -o "$out/SwitchPowerTray-contracts-x64.exe"
 fi
 

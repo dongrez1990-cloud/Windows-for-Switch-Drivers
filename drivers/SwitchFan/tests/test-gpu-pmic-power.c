@@ -24,6 +24,8 @@ typedef void VOID;
 typedef void *PVOID;
 typedef ULONG *PULONG;
 typedef void *WDFDEVICE;
+typedef void *WDFIOTARGET;
+typedef void *WDFINTERRUPT;
 typedef void *WDFREQUEST;
 typedef void *WDFWAITLOCK;
 typedef union { int64_t QuadPart; struct { uint32_t LowPart; int32_t HighPart; }; } LARGE_INTEGER;
@@ -70,6 +72,8 @@ static bool pause_cpu_down, down_waiting, temperature_waiting, allow_down;
 static _Thread_local bool cpu_locked, temperature_thread;
 
 #include "../src/t214/dfll_windows_types.h"
+#include "../src/t214/emc_windows_types.h"
+#include "integration/switch-lite/windows/SwitchFan/src/t214/emc_gpu_vote.h"
 
 typedef struct {
     UCHAR *Car;
@@ -89,6 +93,9 @@ typedef struct {
     volatile LONG GpuDvfsPolicy;
     ULONG GpuReportedKhz, GpuReportedUv, GpuStatusWord;
     SWFAN_DFLL Dfll;
+    SWFAN_EMC Emc;
+    struct tg_emc_gpu_vote EmcGpuVote;
+    ULONGLONG EmcGpuAbiTime;
     ULONGLONG GpuSampleTime;
     ULONGLONG GpuAbiTime;
     ULONGLONG TempSampleTime;
@@ -153,7 +160,6 @@ static VOID SwFanPmicUnlock(PSWFAN_DEVICE Dev)
 
 static PSWFAN_DEVICE SwFanGetDevice(void *d) { return d; }
 static void SwFanTrace(const void *n, ULONG v) { (void)n; (void)v; }
-static VOID SwFanSetDuty(PSWFAN_DEVICE Dev, ULONG Duty) { Dev->Duty = Duty; }
 static NTSTATUS SwFanOpenTarget(void *d, LARGE_INTEGER i, void **t)
 { (void)d; (void)i; *t = (void *)1; return STATUS_SUCCESS; }
 static void WdfObjectDelete(void *p) { (void)p; }
@@ -206,7 +212,8 @@ static void KeDelayExecutionThread(int m, bool a, LARGE_INTEGER *d) { (void)m; (
 static void KeRaiseIrql(unsigned i, KIRQL *o) { (void)i; *o = 0; }
 static void KeLowerIrql(KIRQL i) { (void)i; }
 static void KeStallExecutionProcessor(unsigned n) { (void)n; }
-static ULONGLONG KeQueryInterruptTime(void) { return 10000000; }
+static ULONGLONG interrupt_time = 10000000;
+static ULONGLONG KeQueryInterruptTime(void) { return interrupt_time; }
 #define KeMemoryBarrier() ((void)0)
 static LONG InterlockedExchange(volatile LONG *dst, LONG val)
 { LONG old = *dst; *dst = val; return old; }
@@ -257,6 +264,11 @@ static void regwrite(ULONG *p, ULONG v)
 static ULONG SwFanDfllReadKhz(PSWFAN_DEVICE);
 static NTSTATUS SwFanDfllStopLocked(PSWFAN_DEVICE);
 static NTSTATUS SwFanDvfsUpdateLocked(PSWFAN_DEVICE, ULONG, BOOLEAN);
+static VOID SwFanEmcCpuRateChanged(PSWFAN_DEVICE d, ULONG khz)
+{
+    assert(cpu_locked); /* callback only publishes a vote; no EMC/PMIC wait */
+    d->Emc.CpuRateKhz=(LONG)khz;
+}
 #include "../src/t214/clock.h"
 #include "../src/t214/dfll_windows.h"
 #include "../src/t214/gpu_pmic.h"
@@ -318,6 +330,61 @@ static NTSTATUS send_gpu_pmic(PSWFAN_DEVICE d, struct tg_gpu_pmic_request *op)
     return st;
 }
 
+static void test_emc_gpu_vote(PSWFAN_DEVICE d)
+{
+    struct tg_gpu_pmic_request op;
+    uint32_t word;
+    assert(tg_emc_gpu_request(&d->EmcGpuVote, 740000u, false));
+    word = d->EmcGpuVote.request;
+    op = (struct tg_gpu_pmic_request){0,TG_GPU_PMIC_REPORT_EMC_ACK,1,word + 256u};
+    assert(send_gpu_pmic(d,&op) == STATUS_INVALID_DEVICE_STATE);
+    pmic_regs[0x06] = 0x55; pmic_regs[0x23] = 68;
+    op.value = word;
+    assert(send_gpu_pmic(d,&op) == STATUS_INVALID_DEVICE_STATE && !d->EmcGpuVote.guard_uv);
+    /* The GPU already owns 'word'. Retrying after a busy wait must let its
+     * delayed hardware ACK below complete, without changing the transaction. */
+    assert(tg_emc_gpu_request(&d->EmcGpuVote, 740000u, false));
+    pmic_regs[0x23] = 98; /* GPU owner has raised/calibrated to 740 mV */
+    assert(send_gpu_pmic(d,&op) == STATUS_SUCCESS && d->EmcGpuVote.guard_uv == 740000u);
+    op = (struct tg_gpu_pmic_request){0x33,0x23,1,68};
+    assert(send_gpu_pmic(d,&op) == STATUS_INVALID_DEVICE_STATE && pmic_regs[0x23] == 98);
+    op = (struct tg_gpu_pmic_request){0x33,0x06,1,0x54};
+    assert(send_gpu_pmic(d,&op) == STATUS_INVALID_DEVICE_STATE && pmic_regs[0x06] == 0x55);
+    assert(!tg_emc_gpu_request(&d->EmcGpuVote,590000u,false));
+    assert(tg_emc_gpu_request(&d->EmcGpuVote,590000u,true));
+    op = (struct tg_gpu_pmic_request){0x33,TG_GPU_PMIC_RELEASE_RAIL,1,0x5414};
+    assert(send_gpu_pmic(d,&op) == STATUS_SUCCESS && d->EmcGpuVote.released);
+    assert(pmic_regs[0x06] == 0x55 && pmic_regs[0x23] == 68);
+    assert(d->EmcGpuVote.acknowledged == d->EmcGpuVote.request);
+    assert(tg_emc_gpu_request(&d->EmcGpuVote,0,true));
+    op.value = 0x556e; /* later adapter snapshot included an EMC rail vote */
+    assert(send_gpu_pmic(d,&op) == STATUS_SUCCESS);
+    assert(pmic_regs[0x06] == 0x54 && pmic_regs[0x23] == 20); /* first baseline retained */
+    assert(tg_emc_gpu_request(&d->EmcGpuVote,760000u,false));
+    SwFanPmicLock(d);
+    assert(SwFanGpuApplyReleased(d) == STATUS_SUCCESS);
+    SwFanPmicUnlock(d);
+    assert(d->EmcGpuVote.guard_uv == 760000u && pmic_regs[0x23] == 102 && pmic_regs[0x06] == 0x55);
+    op = (struct tg_gpu_pmic_request){0,TG_GPU_PMIC_CLAIM_RAIL,1,TG_GPU_EMC_VOTE_ABI};
+    assert(send_gpu_pmic(d,&op) == STATUS_SUCCESS && !d->EmcGpuVote.released);
+    fail_pmic_write = true;
+    op = (struct tg_gpu_pmic_request){0x33,TG_GPU_PMIC_RELEASE_RAIL,1,0x5414};
+    assert(!NT_SUCCESS(send_gpu_pmic(d,&op)) && !d->EmcGpuVote.released);
+    assert(d->EmcGpuVote.guard_uv == 760000u);
+    fail_pmic_write = false;
+    assert(send_gpu_pmic(d,&op) == STATUS_SUCCESS && d->EmcGpuVote.released);
+    assert(tg_emc_gpu_request(&d->EmcGpuVote,0,true));
+    word = d->EmcGpuVote.request;
+    op = (struct tg_gpu_pmic_request){0,TG_GPU_PMIC_REPORT_EMC_FAILURE,1,word};
+    assert(send_gpu_pmic(d,&op) == STATUS_SUCCESS && d->EmcGpuVote.failed == word);
+    op = (struct tg_gpu_pmic_request){0,TG_GPU_PMIC_QUERY_EMC_VOTE,0,0};
+    assert(send_gpu_pmic(d,&op) == STATUS_SUCCESS && op.value == d->EmcGpuVote.acknowledged && op.value != word);
+    op = (struct tg_gpu_pmic_request){0,TG_GPU_PMIC_REPORT_EMC_ACK,1,word};
+    assert(send_gpu_pmic(d,&op) == STATUS_INVALID_DEVICE_STATE);
+    op = (struct tg_gpu_pmic_request){0x33,TG_GPU_PMIC_RELEASE_RAIL,1,0x5414};
+    assert(send_gpu_pmic(d,&op) == STATUS_SUCCESS && pmic_regs[0x06] == 0x54 && pmic_regs[0x23] == 20);
+}
+
 int main(void)
 {
     SWFAN_DEVICE d = {0};
@@ -368,6 +435,19 @@ int main(void)
     assert(d.CpuConfigured && d.BootCpuKhz == 998400u && !pmic_locked);
     SwCpuTemperature(&d, 41, TRUE);
     assert(d.CpuApplied && SwCpuKhz(&d) == 1497600u && pmic_regs[0x26] == 174);
+
+    /* A firmware boot value must not masquerade as a fresh runtime EMC rate. */
+    SwFanGetPowerStatus(&d, &st);
+    assert(st.RamActualKhz == 0);
+    d.Emc.SampleTime = interrupt_time;
+    d.Emc.Published.ActualKhz = 2133000u;
+    SwFanGetPowerStatus(&d, &st);
+    assert(st.RamActualKhz == 2133000u);
+    interrupt_time += 60000001u;
+    SwFanGetPowerStatus(&d, &st);
+    assert(st.RamActualKhz == 0);
+    interrupt_time = 10000000;
+    d.Emc.SampleTime = 0;
 
     /* 1. UserMode callers are blocked from TG_GPU_IOCTL_PMIC. */
     requestor_mode = UserMode;
@@ -486,6 +566,7 @@ int main(void)
     assert(send_gpu_pmic(&d,&op)==STATUS_SUCCESS);
     SwFanGetPowerStatus(&d,&st);
     assert(st.GpuReportedKhz==844800 && st.GpuSampleAgeMs==0);
+    test_emc_gpu_vote(&d);
     /* Unsupported / invalid inputs rejected cleanly. */
     assert(SwFanSetPowerMode(&d, 8) == STATUS_INVALID_PARAMETER);
     d.IsLite = FALSE;

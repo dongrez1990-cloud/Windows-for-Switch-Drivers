@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path -LiteralPath $Executable).Path
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $taskName = "SwitchWOA-$App-$sid"
-$arguments = if ($App -eq 'SwitchPowerTray') { '--startup-handheld --minimized' } else { '' }
+$arguments = if ($App -eq 'SwitchPowerTray') { '--startup-profile --minimized' } else { '' }
 $delay = if ($App -eq 'SwitchPowerTray') { 'PT10S' } else { 'PT60S' }
 $service = New-Object -ComObject Schedule.Service
 $service.Connect()

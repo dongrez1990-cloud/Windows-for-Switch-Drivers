@@ -101,7 +101,11 @@ static VOID SwFanGetPowerStatus(PSWFAN_DEVICE Dev, SWFAN_POWER_STATUS *Out)
         (Dev->CpuOverclockEnabled ? CPU_TARGET_KHZ : Dev->BootCpuKhz) : Dev->Config.CpuKhz;
     if (Dev->PowerMode < SwNvpCount) Out->CpuTargetKhz = Dev->Dfll.Control.requested_khz;
     Out->CpuActualKhz = Dev->Car != NULL ? SwCpuKhz(Dev) : 0u;
-    Out->RamActualKhz = Dev->Config.RamActualKhz;
+    /* A boot handoff is not a runtime sample. Consumers that need the boot
+     * value, sample age or enumeration error use GET_EMC_STATUS separately. */
+    Out->RamActualKhz = !Dev->Stopping && Dev->Emc.SampleTime &&
+        KeQueryInterruptTime() - Dev->Emc.SampleTime <= 60000000ULL ?
+        Dev->Emc.Published.ActualKhz : 0u;
     Out->GpuPolicyMode = TG_GPU_DVFS_POLICY_MODE(Policy);
     Out->GpuPolicyMinKhz = TG_GPU_DVFS_POLICY_MIN_KHZ(Policy);
     Out->GpuPolicyMaxKhz = TG_GPU_DVFS_POLICY_MAX_KHZ(Policy);

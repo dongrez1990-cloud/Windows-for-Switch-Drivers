@@ -49,7 +49,7 @@ static NTSTATUS SwBatApplyChargeLimit(PSWBAT_DEVICE Dev, ULONG SocPercent)
     NTSTATUS Status;
 
     if (!SwBatChargeLimitValid(Dev->ChargeLimit)) {
-        Dev->ChargeLimit = SWBAT_CHARGE_LIMIT_OFF;
+        Dev->ChargeLimit = SWBAT_CHARGE_LIMIT_HIGH;
     }
     if (Dev->Charger == NULL) {
         if (Dev->ChargeLimit == SWBAT_CHARGE_LIMIT_OFF) {

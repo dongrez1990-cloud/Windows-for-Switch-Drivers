@@ -209,7 +209,10 @@ static NTSTATUS SwFanDfllStopLocked(PSWFAN_DEVICE d)
     if (d->Dfll.Control.prepared && !SwDfllStop(&io, &d->Dfll.Control))
         return d->Dfll.LastStatus = STATUS_DEVICE_HARDWARE_ERROR;
     if (!SwFanDfllReleaseClocks(d)) return d->Dfll.LastStatus = STATUS_DEVICE_HARDWARE_ERROR;
-    if (SwDfllCpuParent(d) == 1u && SwCpuKhz(d) == d->BootCpuKhz) d->CpuApplied = FALSE;
+    if (SwDfllCpuParent(d) == 1u && SwCpuKhz(d) == d->BootCpuKhz) {
+        d->CpuApplied = FALSE;
+        SwFanEmcCpuRateChanged(d,d->BootCpuKhz);
+    }
     return d->Dfll.LastStatus = STATUS_SUCCESS;
 }
 
@@ -255,6 +258,12 @@ static NTSTATUS SwFanDfllApplyProfileLocked(PSWFAN_DEVICE d, ULONG mode)
             (void)SwFanDfllReleaseClocks(d); return STATUS_DEVICE_HARDWARE_ERROR;
         }
     }
+    if (f->Control.emc_floor_uv != f->EmcFloorUv) {
+        /* A different Vmin changes the calibrated DVCO/skipper denominator. */
+        RtlZeroMemory(f->Control.floor_khz, sizeof(f->Control.floor_khz));
+        RtlZeroMemory(f->Control.high_floor_khz, sizeof(f->Control.high_floor_khz));
+        f->Control.emc_floor_uv = f->EmcFloorUv;
+    }
     target = SwFanDfllChooseRate(d);
     if (f->Control.active ? !SwDfllSetRate(&io, &f->Control, target, (int32_t)d->LastTemp) :
                            !SwDfllStart(&io, &f->Control, target, (int32_t)d->LastTemp)) {
@@ -263,6 +272,10 @@ static NTSTATUS SwFanDfllApplyProfileLocked(PSWFAN_DEVICE d, ULONG mode)
     }
     d->CpuApplied = FALSE; /* CpuApplied denotes the legacy PLLX overclock only. */
     d->CpuThrottled = f->Control.thermally_limited;
+    /* Like tegra210-cpufreq's successful rate-change callback, update the
+     * bandwidth floor after the CPU transition. BPMP work runs separately;
+     * never acquire the EMC transaction lock while holding CpuLock. */
+    SwFanEmcCpuRateChanged(d,f->Control.requested_khz);
     /* Read-only IOCTL reports the current hardware result. Do not write the
      * registry four times per second from utilization hints; the fan timer
      * already records its periodic CPU sample. */

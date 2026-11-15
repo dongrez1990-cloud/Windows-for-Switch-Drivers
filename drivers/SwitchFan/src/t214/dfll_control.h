@@ -48,6 +48,7 @@ struct sw_dfll_control {
     struct sw_dfll_table table;
     struct sw_dfll_request request;
     uint32_t boot_uv, requested_khz, measured_khz, measured_uv;
+    uint32_t emc_floor_uv;
     uint32_t floor_khz[3], high_floor_khz[3];
     uint32_t high_threshold_khz, high_default_floor_khz;
     uint8_t lut_min, lut_max, lut_safe, high_min, high_start;
@@ -207,6 +208,7 @@ static bool SwDfllSetRate(const struct sw_dfll_io *io, struct sw_dfll_control *s
         return false;
     range = temperature_c <= 20 ? 0u : temperature_c <= 70 ? 1u : 2u;
     floor_uv = range == 0u ? 800000u : SwDfllCodeUv(s->table.lut[0]);
+    if (floor_uv < s->emc_floor_uv) floor_uv = s->emc_floor_uv;
     cap_uv = temperature_c >= 84 ? 1010000u : temperature_c >= 64 ? 1060000u : SW_DFLL_MAX_UV;
     high = SwDfllLutFloor(&s->table, cap_uv);
     target = SwDfllRateBelowUv(&s->table, SwDfllCodeUv(s->table.lut[high]));
@@ -272,7 +274,7 @@ static bool SwDfllStop(const struct sw_dfll_io *io, struct sw_dfll_control *s)
     if (s->active) {
         /* Low tuning is characterized at every supported rail. Hold a known
          * voltage for the boot PLLX before handing CPU/M4 control back. */
-        boot = SwDfllLutCeil(&s->table, s->boot_uv);
+        boot = SwDfllLutCeil(&s->table, s->boot_uv > s->emc_floor_uv ? s->boot_uv : s->emc_floor_uv);
         if (io->cpu_parent(io->context) != 2u || !io->prepare_boot_pllx(io->context) ||
             !SwDfllTune(io, s, false) ||
             !SwDfllWrite(io, SW_DFLL_FORCE, 0x40u | boot, 0x7fu)) {

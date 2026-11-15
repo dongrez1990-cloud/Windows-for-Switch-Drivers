@@ -4,7 +4,8 @@ Drivers for the **HDH-001 (Tegra T214)** port of Windows 11 ARM64. They use the 
 
 ## Drivers on hardware
 
-Package versions below reflect the 2026-11-12/13 UTC device inventories where available.
+Power/tool rows were updated on2026-11-15; other package rows retain their
+2026-11-12/13 inventories.
 Installation alone does not establish feature acceptance; older default-branch
 source and earlier validation baselines are identified explicitly.
 
@@ -18,10 +19,15 @@ source and earlier validation baselines are identified explicitly.
 | `switchsio` 0.2.5.0 desktop controls | Current installed version verified. Left-stick pointer, ZR/ZL clicks, Capture desktop mode and **+** On-Screen Keyboard are the existing mapping; right-stick scrolling, R3 middle click and D-pad arrows were added in 0.2.3. This inventory does not newly validate those features on 0.2.5.0. [Button mapping](drivers/SwitchSensor/README.md) |
 | `switchaudio` 1.0.0.9 | The built-in speakers play audio. Headphones and jack switching await testing. |
 | `switchrtc` 1.0.0.3 | Installed package reverified after the SD update. Earlier RTC/time restoration passed; this version inventory is not a new long-term clock-retention test. |
-| `switchfan` **1.0.0.13** | Installed as `oem91.inf`; default CPU target and post-reboot readback are **1497.6 MHz**, with CPU error 0. The curve remains 32% PWM at 35 C, 75% at 40 C and 100% at 45 C; thermal throttling and screen-off policy are retained. PWM commands are not measured RPM. [CPU and cooling evidence](drivers/SwitchFan/README.md) |
-| `switchpwrbtn` 1.0.0.6 installed; 1.0.0.4 default source | The device inventory reports 1.0.0.6. The earlier owner-confirmed S0 screen-off/wake result and 12 power/12 wake reports apply to 1.0.0.4. This does not validate the uncommitted 1.0.0.6 source or implement SC7/S4. [Default source](drivers/SwitchPowerButton) |
-| `switchbattery` 1.0.0.11 / shutdown | Includes the battery request-ownership correction introduced in 1.0.0.8, on which normal shutdown powered off the tested Lite with Wi-Fi, Bluetooth, audio and gamepad enabled. Native restart subsequently passed on the normal R6 firmware without fan pulses. [Power status](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/power-performance.md) |
-| `switchbattery` 1.0.0.11 / charging | Enables BQ24193 hardware charge termination and an eight-hour safety timer independently of the optional USB-C PD resource. Installed register readback passed; a complete full-charge/recharge cycle remains unverified. [Charging policy](docs/hdh001/README.md#charge-termination) |
+| `switchfan` **1.0.0.33** | Noble ACTMON watermark IRQs and CPU/display EMC floors;204/1331.2/1600/2500MHz trained points. Native errors0, real IRQ and completed transitions verified; owner manual testing passed. Seven power/three independent fan choices saved. [Current evidence](docs/hdh001/dvfs-tray.md) |
+| `switchpwrbtn` **1.0.0.7** | Current polling implementation with validated VDD_CORE vote handling. Earlier owner-confirmed S0 screen-off/wake applies to1.0.0.4; no new SC7/S4 acceptance. [Source](drivers/SwitchPowerButton) |
+| `switchbattery` **1.0.0.14** / shutdown | Includes the battery request-ownership correction introduced in 1.0.0.8, on which normal shutdown powered off the tested Lite with Wi-Fi, Bluetooth, audio and gamepad enabled. Native restart subsequently passed on the normal R6 firmware without fan pulses. [Power status](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/power-performance.md) |
+| `switchbattery` **1.0.0.14** / charging and telemetry | Retains charge termination/safety timer; persistent85%limit uses80–90%hysteresis. Cached, calibrated MAX17050 signed current and battery net power verified; this is not AC total power. [Current evidence](docs/hdh001/dvfs-tray.md) |
+
+Switch Power and Pacecar auto-start in the desktop session, with saved independent
+power/fan choices, battery net watts and50%background transparency. The original
+Switchroot Joy-Con icon is embedded in Switch Power. The desktop
+`打开硬件工具.cmd` reopens both; no tool shortcuts are required.
 
 The experimental Tegra GPU driver and Mesa NVK ICD are maintained together. Native Vulkan triangle readback and Display-class Code 0 were verified on the Lite. DWM acceleration is in development. [GPU project](https://github.com/ruje0504-2/mesa-switch-woa)
 

@@ -63,6 +63,12 @@ static NTSTATUS SwCpuVoltage(PSWFAN_DEVICE Dev, UCHAR Code)
     LARGE_INTEGER Delay;
     ULONG_PTR Bytes = 0;
     NTSTATUS Status;
+#ifdef SWFAN_HAVE_DFLL
+    if (Dev->Dfll.EmcFloorUv > 250000u + (ULONG)Code * 5000u) {
+        Code = (UCHAR)((Dev->Dfll.EmcFloorUv - 250000u + 4999u) / 5000u);
+        Buffer[1] = Code;
+    }
+#endif
     WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&Memory, Buffer, sizeof(Buffer));
     WDF_REQUEST_SEND_OPTIONS_INIT(&Options, WDF_REQUEST_SEND_OPTION_TIMEOUT);
     Options.Timeout = WDF_REL_TIMEOUT_IN_MS(200);

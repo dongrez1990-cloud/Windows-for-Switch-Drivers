@@ -3,8 +3,8 @@
  *
  * ACPI device BAT0 (ACPI\SWOA0301) has two I2cSerialBus connections on I2C1:
  *   0: MAX17050 fuel gauge (0x36): RepSOC 0x06 (1/256 %), VCELL 0x09
- *      (bits 15:3 x 0.625 mV), Current 0x0A (signed, 1.5625 uV / 5 mOhm =
- *      0.3125 mA, + = charging), Temp 0x08 (signed 1/256 C)
+ *      (bits 15:3 x 0.625 mV), Current 0x0A (signed, calibrated 156.25 uA
+ *      per LSB on the Switch's 5 mOhm / 2x-gain board), Temp 0x08
  *   1: BQ24193 charger (0x6B): SYS_STAT 0x08 (VBUS_STAT 7:6: 1 USB host,
  *      2 adapter, 3 OTG; CHRG_STAT 5:4: 1 pre, 2 fast, 3 done; PG bit 2)
  * Capacity is reported relative (0-100 %), like the gauge's RepSOC. Values
@@ -38,6 +38,7 @@
 #include <batclass.h>
 #include <spb.h>
 #include "usb_pd.h"
+#include "gauge_telemetry.h"
 
 #define GAUGE_REPSOC   0x06
 #define GAUGE_TEMP     0x08
@@ -45,7 +46,7 @@
 #define GAUGE_CURRENT  0x0A
 #define CHARGER_SYSSTAT 0x08
 #define BATTERY_TAG    1
-#define POLL_MS        10000
+#define POLL_MS        2000
 
 /* BM92T (Linux bm92txx / UEFI R288-R363) */
 #define BM_STATUS1       0x03
@@ -124,6 +125,8 @@ typedef struct _SWBAT_DEVICE {
     BOOLEAN ChargeLimitInitialized;
     BOOLEAN SuspendChargeDisabled;
     NTSTATUS LastLimitStatus;
+    SWBAT_TELEMETRY_STATUS Telemetry;
+    ULONGLONG TelemetryTime;
 } SWBAT_DEVICE, *PSWBAT_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(SWBAT_DEVICE, SwBatGetDevice)
 
@@ -629,6 +632,24 @@ VOID SwBatEvtUsbcTimer(WDFTIMER Timer)
     WdfWaitLockRelease(Dev->Lock);
 }
 
+/* Read-only telemetry piggybacks on the existing battery poll. A failure
+ * invalidates power measurements without breaking charge/status management.
+ * Caller holds Dev->Lock; public telemetry reads never issue I2C requests. */
+static VOID SwBatSampleTelemetry(PSWBAT_DEVICE Dev, USHORT Vcell)
+{
+    USHORT Current=0, Gain=0, Gauge=0;
+    NTSTATUS Status=SwBatRead16(Dev->Gauge,0x21,&Gauge);
+    if (NT_SUCCESS(Status)) Status=SwBatRead16(Dev->Gauge,0x2e,&Gain);
+    if (NT_SUCCESS(Status)) Status=SwBatRead16(Dev->Gauge,GAUGE_CURRENT,&Current);
+    Dev->Telemetry.Version=SWBAT_TELEMETRY_VERSION;
+    Dev->Telemetry.Flags=0;
+    if (NT_SUCCESS(Status) &&
+        !sw_bat_convert_telemetry(Gauge,Gain,Vcell,Current,&Dev->Telemetry))
+        Status=STATUS_NOT_SUPPORTED;
+    Dev->Telemetry.LastStatus=(ULONG)Status;
+    if (NT_SUCCESS(Status)) Dev->TelemetryTime=KeQueryInterruptTime();
+}
+
 /* Read gauge + charger into a BATTERY_STATUS. Caller holds Dev->Lock. */
 static NTSTATUS SwBatReadStatus(PSWBAT_DEVICE Dev, PBATTERY_STATUS Out)
 {
@@ -644,8 +665,11 @@ static NTSTATUS SwBatReadStatus(PSWBAT_DEVICE Dev, PBATTERY_STATUS Out)
     }
     if (!NT_SUCCESS(Status)) {
         SwBatTrace(L"LastGaugeError", (ULONG)Status);
+        Dev->Telemetry.Flags=0;
+        Dev->Telemetry.LastStatus=(ULONG)Status;
         return Status;
     }
+    SwBatSampleTelemetry(Dev,Vcell);
     Percent = Soc >> 8;
     if (Percent > 100) {
         Percent = 100;
@@ -850,9 +874,13 @@ NTSTATUS SwBatEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
     SwBatTrace(L"GaugeIdLow", Dev->GaugeId.LowPart);
     SwBatTrace(L"GaugeIdHigh", (ULONG)Dev->GaugeId.HighPart);
     SwBatTrace(L"ChargerIdLow", Dev->ChargerId.LowPart);
-    Dev->ChargeLimit = SwBatReadParam(L"ChargeLimit", SWBAT_CHARGE_LIMIT_OFF);
+    Dev->ChargeLimit = SwBatReadParam(L"ChargeLimit", SWBAT_CHARGE_LIMIT_HIGH);
+    RtlZeroMemory(&Dev->Telemetry,sizeof(Dev->Telemetry));
+    Dev->Telemetry.Version=SWBAT_TELEMETRY_VERSION;
+    Dev->Telemetry.LastStatus=(ULONG)STATUS_DEVICE_NOT_READY;
+    Dev->TelemetryTime=0;
     if (!SwBatChargeLimitValid(Dev->ChargeLimit)) {
-        Dev->ChargeLimit = SWBAT_CHARGE_LIMIT_OFF;
+        Dev->ChargeLimit = SWBAT_CHARGE_LIMIT_HIGH;
     }
     Dev->ChargeInhibited = FALSE;
     Dev->ChargeLimitInitialized = FALSE;
@@ -1027,6 +1055,21 @@ VOID SwBatEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputBu
     NTSTATUS Status;
 
     switch (IoControlCode) {
+    case IOCTL_SWBAT_GET_TELEMETRY: {
+        SWBAT_TELEMETRY_STATUS *Out=NULL;
+        Status=WdfRequestRetrieveOutputBuffer(Request,sizeof(*Out),(PVOID *)&Out,NULL);
+        if (!NT_SUCCESS(Status)) break;
+        WdfWaitLockAcquire(Dev->Lock,NULL);
+        *Out=Dev->Telemetry;
+        ULONGLONG Age=Dev->TelemetryTime ?
+            (KeQueryInterruptTime()-Dev->TelemetryTime)/10000u : MAXULONG;
+        Out->SampleAgeMs=Age>MAXULONG ? MAXULONG : (ULONG)Age;
+        if (Dev->Stopping || Out->SampleAgeMs>SWBAT_TELEMETRY_MAX_AGE_MS)
+            Out->Flags&=~SWBAT_TELEMETRY_VALID;
+        WdfWaitLockRelease(Dev->Lock);
+        Bytes=sizeof(*Out);
+        break;
+    }
     case IOCTL_SWBAT_GET_CHARGE_LIMIT: {
         SWBAT_CHARGE_LIMIT_STATUS *Out = NULL;
         UNREFERENCED_PARAMETER(InputBufferLength);
@@ -1171,7 +1214,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBatParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBatParamsPath);
     }
-    SwBatTrace(L"DriverVersion", 12);
+    SwBatTrace(L"DriverVersion", 14);
 
     WDF_DRIVER_CONFIG_INIT(&Config, SwBatEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);

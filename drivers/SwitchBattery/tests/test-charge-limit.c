@@ -249,6 +249,11 @@ int main(void)
     assert(SwBatSetChargeLimitValue(&d, SWBAT_CHARGE_LIMIT_HIGH, &notify) == STATUS_DEVICE_DATA_ERROR);
     assert(d.ChargeLimit == SWBAT_CHARGE_LIMIT_OFF && !d.ChargeInhibited);
 
+    reset_fixture(&d, 95);
+    d.ChargeLimit = 123; /* invalid persisted state follows the 85% baseline */
+    assert(SwBatRefreshChargeLimit(&d) == STATUS_SUCCESS);
+    assert(d.ChargeLimit == SWBAT_CHARGE_LIMIT_HIGH && d.ChargeInhibited);
+    assert_non_mode_regs_intact();
     puts("Battery charge limit: 50-60/80-90 hysteresis, zero-HIZ, OTG, suspend/wake and fault rollback passed");
     return 0;
 }

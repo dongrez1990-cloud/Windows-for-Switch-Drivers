@@ -21,6 +21,7 @@ typedef struct {
     struct sw_dfll_control Control;
     ULONG SavedSources[2], SavedReset, SavedGate, SavedBankReset;
     ULONG CpuMinKhz, CpuMaxKhz, CpuRequestedMaxKhz, LoadPermille;
+    ULONG EmcFloorUv;
     ULONGLONG LoadTime;
     NTSTATUS LastStatus;
     BOOLEAN ClocksOwned, FaultLatched;

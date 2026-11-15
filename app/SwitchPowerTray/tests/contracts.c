@@ -91,19 +91,38 @@ int wmain(void)
 
     /* Login can precede KMD activation. Do not consume the one-shot default
      * until the provider is ready, nor overwrite a manually chosen mode later. */
-    g_startupHandheldPending = TRUE;
+    g_startupProfilePending = TRUE;
     g_app.HavePower = FALSE;
-    ApplyStartupHandheld(NULL);
-    assert(g_startupHandheldPending);
+    ApplyStartupProfile(NULL);
+    assert(g_startupProfilePending);
     g_app.HavePower = TRUE;
     g_app.Power.IsLite = g_app.Power.CpuDfllAvailable = 1;
     g_app.Power.Flags = 0;
-    ApplyStartupHandheld(NULL);
-    assert(g_startupHandheldPending);
+    ApplyStartupProfile(NULL);
+    assert(g_startupProfilePending);
     g_app.Power.Flags = SWFAN_POWER_FLAG_LIVE_GPU_COUNTER;
+    g_app.Power.TempValid=1;
     g_app.Power.PowerMode = SwFanPowerModeHandheld;
-    ApplyStartupHandheld(NULL);
-    assert(!g_startupHandheldPending);
+    ApplyStartupProfile(NULL);
+    assert(!g_startupProfilePending);
+    /* A saved non-default selection survives logon. Fan intent is separate
+     * and may be restored before the GPU provider becomes available. */
+    assert(WriteRegDword(REG_SETTINGS_KEY,REG_POWER_MODE_VALUE,SwFanPowerModeOcGpu)==ERROR_SUCCESS);
+    g_app.Power.PowerMode=SwFanPowerModeOcGpu;
+    g_startupProfilePending=TRUE;
+    ApplyStartupProfile(NULL);
+    assert(!g_startupProfilePending &&
+        ReadRegDword(REG_SETTINGS_KEY,REG_POWER_MODE_VALUE,999)==SwFanPowerModeOcGpu);
+    assert(WriteRegDword(REG_SETTINGS_KEY,REG_FAN_MODE_VALUE,SwFanProfileCool)==ERROR_SUCCESS);
+    g_app.HaveFan=TRUE;g_app.Fan.Mode=SwFanProfileCool;
+    g_app.Fan.Flags=SWFAN_PROFILE_VALID;g_app.Fan.SampleAgeMs=0;
+    g_startupFanPending=TRUE;g_app.Power.Flags=0;
+    ApplyStartupProfile(NULL);
+    assert(!g_startupFanPending &&
+        ReadRegDword(REG_SETTINGS_KEY,REG_POWER_MODE_VALUE,999)==SwFanPowerModeOcGpu);
+    assert(SetFanMode(SwFanProfileConsole)==ERROR_NOT_READY);
+    assert(ReadRegDword(REG_SETTINGS_KEY,REG_FAN_MODE_VALUE,999)==SwFanProfileCool);
+    g_app.HaveFan=FALSE;
     g_app.HavePower = FALSE;
 
     /* Recreate the notification icon after Explorer broadcasts TaskbarCreated. */
