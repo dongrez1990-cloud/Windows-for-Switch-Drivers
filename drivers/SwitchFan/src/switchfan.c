@@ -231,8 +231,8 @@ static NTSTATUS SwFanDvfsUpdateLocked(PSWFAN_DEVICE Dev, ULONG Temp, BOOLEAN Val
 #ifdef SWITCH_LITE_GPU
 #include "t214/dfll_windows.h"
 #include "t214/gpu_pmic.h"
-#include "integration/switch-lite/windows/SwitchFan/src/t214/host1x_clock.h"
 #include "t214/emc_windows.h"
+#include "integration/switch-lite/windows/SwitchFan/src/t214/host1x_clock.h"
 #endif
 
 /* ------------------------------------------------------------------- fan */
