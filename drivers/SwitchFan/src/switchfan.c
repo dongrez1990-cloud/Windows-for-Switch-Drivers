@@ -231,6 +231,7 @@ static NTSTATUS SwFanDvfsUpdateLocked(PSWFAN_DEVICE Dev, ULONG Temp, BOOLEAN Val
 #ifdef SWITCH_LITE_GPU
 #include "t214/dfll_windows.h"
 #include "t214/gpu_pmic.h"
+#include "integration/switch-lite/windows/SwitchFan/src/t214/host1x_clock.h"
 #include "t214/emc_windows.h"
 #endif
 
@@ -444,6 +445,10 @@ VOID SwFanEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLengt
     }
 
 #ifdef SWITCH_LITE_GPU
+    if (Code == TG_HOST1X_IOCTL_CLOCK_HOLD) {
+        SwFanHost1xDispatch(WdfIoQueueGetDevice(Queue), Request);
+        return;
+    }
     if (Code == IOCTL_SWFAN_GET_EMC_STATUS) {
         SWFAN_EMC_STATUS *Out;
         Status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*Out), (PVOID *)&Out, NULL);
@@ -1095,7 +1100,11 @@ NTSTATUS SwFanEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     QueueConfig.EvtIoDeviceControl = SwFanEvtIoDeviceControl;
     WDF_OBJECT_ATTRIBUTES_INIT(&Attributes);
     Attributes.ExecutionLevel = WdfExecutionLevelPassive;
-    return WdfIoQueueCreate(Device, &QueueConfig, &Attributes, WDF_NO_HANDLE);
+    Status = WdfIoQueueCreate(Device, &QueueConfig, &Attributes, WDF_NO_HANDLE);
+#ifdef SWITCH_LITE_GPU
+    if (NT_SUCCESS(Status)) Status = SwFanHost1xCreateQueue(Device);
+#endif
+    return Status;
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
