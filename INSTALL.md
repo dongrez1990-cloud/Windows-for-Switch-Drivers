@@ -17,7 +17,8 @@
 
 | 东西 | 说明 |
 |---|---|
-| **初代 Switch / OLED**（T210 / Erista） | Lite（HDH-001）不适用本文 |
+| **初代 Switch（2017）`HAC-001`** —— Tegra X1 / T210 / Erista | **只有这个型号经过实测**。判断方法：机器上跑 `Get-CimInstance Win32_ComputerSystem` 看 `Model` 是不是 `Nintendo  Switch  (HAC-001)`，且 `Win32_Processor.Name` 是 `NVIDIA Tegra X1`（不是 `X1+`） |
+| **续航版 V2（HAC-001(-01)）、Lite（HDH-001）、OLED（HEG-001）** | ⚠️ 这三台都是 **Mariko / T210B01 / T214**，与本套驱动**代际不同，未验证**。Lite 请走上游 `docs/hdh001/`；续航版和 OLED 目前没有验证过的公开方案，别硬装 |
 | **Windows 11 ARM64 镜像** | 你自己的安装介质 |
 | **microSD 卡** | 建议 128 GB 以上 |
 | **hekate 启动方式** | RCM 注入（USB）或 Atmosphere 引导。负载已在仓库里 |

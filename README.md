@@ -1,7 +1,11 @@
 # 初代 Switch（Erista / T210）Windows 驱动全套装 —— 装完即用
 
-> 这套东西能让**初代 Nintendo Switch / OLED（Tegra X1 / T210）**跑起完整的 Windows 11 ARM64 驱动栈：
-> Wi-Fi、蓝牙、电源管理、风扇/背光、电池、触屏、手柄（Joy-Con）、SD 卡、音频、GPIO/I²C。
+> 这套东西能让**初代 Nintendo Switch（HAC-001，Tegra X1 / T210 / Erista）**跑起完整的
+> Windows 11 ARM64 驱动栈：Wi-Fi、蓝牙、电源管理、风扇/背光、电池、触屏、手柄（Joy-Con）、
+> SD 卡、音频、GPIO/I²C。
+>
+> ⚠️ **只适用于初代 HAC-001**。续航版（V2）、Lite、OLED 都是 Mariko（T210B01 / T214），
+> 代际不同，见下方「适用机型」。
 >
 > 作者机器实测（2026-11-18）：13 个驱动全部正常，Wi-Fi `Up 866.7 Mbps`，
 > 连续 5 次断连重连 + 10 轮浸泡全部自动恢复，**全程无需禁用/启用网卡**。
@@ -19,15 +23,21 @@ git checkout restore/20261118
 **一句话**：`install\Install-SwitchDrivers.ps1` 一个脚本把三张证书 + 13 个驱动按正确顺序装完并自检。
 **不需要编译任何东西。**
 
-## 适用机型
+## 适用机型（重要，别装错）
 
-| 机型 | 代号 | 本文适用 |
-|---|---|---|
-| 初代 Switch / OLED（Tegra X1） | **Erista / T210** | ✅ |
-| Switch Lite（Tegra X1+） | HDH-001 / T214 | ❌ 请走上游 [`ruje0504-2/Windows-for-Switch-Drivers`](https://github.com/ruje0504-2/Windows-for-Switch-Drivers) 的 `docs/hdh001/` |
+| 机型 | 型号 | SoC | 本套东西 |
+|---|---|---|---|
+| **初代 Switch**（2017） | **HAC-001** | **Tegra X1 / T210**（Erista） | ✅ **就是在本机实测的**（SMBIOS 自报 `HAC-001` / `Tegra X1` / BIOS `winx-r402`） |
+| 续航版 V2（2019） | HAC-001(-01) | Tegra X1+ / T210B01（**Mariko**） | ⚠️ **未实测**。SoC 换了代，别直接套用 |
+| Switch Lite | HDH-001 | T210B01（**Mariko**） | ⚠️ 未实测。**上游就是为它写的** → 直接用 [`ruje0504-2/Windows-for-Switch-Drivers`](https://github.com/ruje0504-2/Windows-for-Switch-Drivers) 的 `docs/hdh001/` |
+| Switch OLED（2021） | HEG-001 | T210B01（**Mariko**） | ⚠️ **未实测**。除了 SoC，面板 / 背光 / 底座 / 64 GB eMMC 都与 Lite、初代不同，属于**独立移植课题**，不能直接套 |
 
-上游主线是**为 Lite 写的**（`SWITCH_LITE_TOUCH` / `SWITCH_LITE_GPU` / T214 时钟树）。
-本仓库这三条分支是把它**适配到 Erista** 的成果。
+> **一句话**：本文只对 **HAC-001（初代 / T210 / Erista）** 负责。
+> **续航版、Lite、OLED 都是 Mariko（T210B01 / T214）**，与本机代际不同 ——
+> 其中 Lite 有上游现成支持，续航版和 OLED 目前没有经过验证的公开方案。
+>
+> 这也是为什么本仓库的分支叫 `erista-*`：它做的是**把上游那套 Lite(T214) 代码搬回初代(T210)**，
+> 方向恰好相反，不能倒着用。
 
 ## 三条分支
 
