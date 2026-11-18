@@ -19,6 +19,17 @@
 原因：上游主线是**为 Lite 写的**（`SWITCH_LITE_TOUCH`、`SWITCH_LITE_GPU`、T214 的
 DFLL/EMC/ACTMON 时钟树）。本文这三条分支是**把同一套东西适配到 Erista** 的产物。
 
+## ★ 你需要自己做什么（先看这张表）
+
+| 类别 | 内容 | 你要做什么 |
+|---|---|---|
+| **A. 直接装，不用构建**<br>（13 套） | switchwifi 0.7.4 / 0.7.2 / 回退包、switchbt 1.0.0.19、switchfan 1.0.0.22、switchaudio 1.0.0.17、switchbattery 1.0.0.11、switchpwrbtn 1.0.0.4、switchsio 0.2.3.0、tegra210i2c 1.0.0.5、switchjoycon 0.3.20、tegra210sdhc 0.4.0.1 | 只需导入证书 → `pnputil` 安装（第五节）。**签名私钥不是你的，但你装现成包不需要私钥**，只需要信任它们的证书 |
+| **B. 有成品，但很可能要你自己重签**<br>（4 套） | switchtouch 1.0.0.4、switchrtc 1.0.0.2、switchsensor 1.0.0.1、tegra210gpio 1.0.0.4 | 这 4 个由**第三张证书**（`A9E1F054…`）签名，而**作者手里也没有这张证书的私钥**（只剩指纹记录）。<br>→ 若你的机器不信任它：用 `erista-0.7.x` 源码重编这 4 个，再用你的证书签名（§4.2）。<br>→ 或者从任何一台已信任该证书的机器导出它的 `.cer` 并导入 |
+| **C. 固件已给成品，不用编译** | `firmware\winx-v39\{bl31.bin, bl33.bin}`（UEFI/EDK2 成品）、`firmware\hekate\hekate_ctcaer_6.5.5.bin`、`esp\startup.nsh`、`esp\bootloader\hekate_ipl.ini` + 41 个启动项 | 直接拷到 SD 卡用。**只有你想改 UEFI 代码时**才需要按 §4.3 重新编译 `bl33.bin` |
+| **D. 必须自己准备（不是构建，是获取）** | Windows 11 **ARM64** 镜像、SD 卡、hekate 启动方式（RCM 注入或 Atmosphere） | 这些不在仓库里，也不该在 |
+
+> **一句话总结**：拿到这套东西，Erista 机器上**只有 4 个驱动可能需要你自己重编重签**（原因是一张证书的私钥丢失），其余全部可以直接装。
+
 ## 一、三条分支分别是干什么的
 
 仓库：`https://github.com/dongrez1990-cloud/Windows-for-Switch-Drivers`
@@ -27,9 +38,9 @@ DFLL/EMC/ACTMON 时钟树）。本文这三条分支是**把同一套东西适�
 |---|---|---|
 | **`erista-0.7.x`**（+ tag `erista-0.7.4.0`） | 板级驱动源码：**Wi-Fi 0.7.4**、电源键、音频、SD 卡(UHS)、14 个主机测试、构建脚本 | 编驱动 |
 | **`uefi/erista`** | UEFI 引导层（WinX/EDK2）改动：Wi-Fi+蓝牙初始化、`t210/` 阶段表、ACPI/电源表、SD、`WifiHandoff`（UEFI→Windows 交棒） | 编 `bl33.bin` |
-| **`restore/20261118`**（本文所在分支） | **17 套已签名成品包**（Wi-Fi/蓝牙/风扇/触屏/电池/电源键/RTC/传感器/音量/GPIO/I2C/SD/手柄，版本与作者机器实测一致）、手柄驱动源码、UEFI 补丁、引导配置、文档、工具 | **不想编译就装成品** |
+| **`restore/20261118`**（本文所在分支） | **17 套已签名成品包**（版本与作者机器实测一致）、**UEFI 成品固件**（`bl31/bl33`）+ hekate 负载、手柄驱动源码、UEFI 补丁、引导配置、文档、工具 | **不想编译就装成品** |
 
-> 只想尽快把机器装回来：**不用编译**，直接跳到第五节，用 `packages\` 里的成品逐个 `pnputil` 安装即可。
+> 只想尽快把机器装回来：**基本不用编译**，直接跳到第五节，用 `packages\` 里的成品逐个 `pnputil` 安装即可。
 
 > ⚠️ **不要把 `erista-0.7.x` 合并进上游默认分支**。它基于 2026-11-08 的快照，
 > 相对今天的上游会删掉 SwitchFan(约 6700 行)/SwitchBattery 等新代码。它只用于取回 Erista 这一版。

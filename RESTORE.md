@@ -30,7 +30,17 @@
 | `patches\` | `0001-UEFI-WinX-Erista-...patch` —— UEFI 那 16 个文件的完整补丁（`git am` 可直接应用） |
 | `esp\` | 引导配置：`startup.nsh`、`bootloader\hekate_ipl.ini`、`bootloader\ini\*.ini`（各启动项）<br>`MANIFEST-binaries-sha256.txt`：44 个引导二进制的哈希清单（**只记哈希不装文件**，重新获取后可比对） |
 | `docs\` | 交接文档、0.7.3/0.7.4 报告、基线清单、上机日志、故障记录、**实测驱动版本清单** |
+| `firmware\` | **引导成品，不用编译**：`winx-v39\{bl31.bin, bl33.bin}`（UEFI/EDK2 构建产物，GPL-2.0，源码在 `uefi/erista`）、`hekate\hekate_ctcaer_6.5.5.bin`（上游 hekate） |
 | `tools\` | 构建/测试/签名脚本、`HostTests\`、测试证书、`wdk-patch\`、上机部署脚本、回退包打包脚本 |
+
+### 需要自己构建的只有这些
+
+| 情况 | 是否要自己构建 |
+|---|---|
+| 13 套驱动（wifi/bt/fan/audio/battery/pwrbtn/sio/i2c/sdhc/joycon…） | ❌ 直接装 |
+| **switchtouch / switchrtc / switchsensor / tegra210gpio** | ⚠️ 它们由第三张证书 `A9E1F054…` 签名，**该证书私钥已不在任何机器上**（只剩指纹）。若目标机不信任它 → 用 `erista-0.7.x` 源码重编这 4 个 + 你自己的证书签名 |
+| UEFI `bl33.bin` / `bl31.bin` / hekate | ❌ 已给成品；只有要改 UEFI 代码时才重编（见 `README.md` §4.3） |
+| Windows 镜像、SD 卡、hekate 启动方式 | —— 属于"必须自己准备"，不是构建 |
 
 ## 三、重建环境
 
