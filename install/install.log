@@ -1,0 +1,33 @@
+﻿Install-SwitchDrivers 2026-11-18 15:49:36
+[15:49:36] package root : D:\paopao\restore-20261118\packages
+[15:49:36] elevated     : False
+[15:49:36] dry-run without elevation: nothing will be written
+[15:49:36] certificate   : switchwoa-2020-05C4B7DA.cer  thumbprint=05C4B7DA0D3B425DC42A419BDF65A6CB8E343A9F
+[15:49:36]                 [dry-run] would import into LocalMachine\Root
+[15:49:36]                 [dry-run] would import into LocalMachine\TrustedPublisher
+[15:49:36] certificate   : switchwoa-current-A7C0A920.cer  thumbprint=A7C0A920EA92058659352F75C203EC284B4AF1E4
+[15:49:36]                 [dry-run] would import into LocalMachine\Root
+[15:49:36]                 [dry-run] would import into LocalMachine\TrustedPublisher
+[15:49:36] certificate   : switchwoa-stage6-A9E1F054.cer  thumbprint=A9E1F054DFCC96F43010918892C3C30D5A522712
+[15:49:36]                 [dry-run] would import into LocalMachine\Root
+[15:49:37]                 [dry-run] would import into LocalMachine\TrustedPublisher
+[15:49:37] testsigning  : OFF  -> these test-signed drivers will not load. Run: bcdedit /set testsigning on
+[15:49:37] tegra210gpio   [dry-run] tegra210gpio-1.0.0.4 (1.0.0.4) -> pnputil /add-driver "D:\paopao\restore-20261118\packages\tegra210gpio-1.0.0.4\tegra210gpio.inf" /install
+[15:49:37] tegra210i2c    [dry-run] tegra210i2c-1.0.0.5 (1.0.0.5) -> pnputil /add-driver "D:\paopao\restore-20261118\packages\tegra210i2c-1.0.0.5\tegra210i2c.inf" /install
+[15:49:37] tegra210sdhc   [dry-run] tegra210sdhc-0.4.0.1 (0.4.0.1) -> pnputil /add-driver "D:\paopao\restore-20261118\packages\tegra210sdhc-0.4.0.1\nvtsdhc.inf" /install
+[15:49:37] switchtouch    [dry-run] switchtouch-1.0.0.4 (1.0.0.4) -> pnputil /add-driver "D:\paopao\restore-20261118\packages\switchtouch-1.0.0.4\switchtouch.inf" /install
+[15:49:37] switchsensor   [dry-run] switchsensor-1.0.0.1 (1.0.0.1) -> pnputil /add-driver "D:\paopao\restore-20261118\packages\switchsensor-1.0.0.1\switchsensor.inf" /install
+[15:49:37] switchsio      [dry-run] switchsio-0.2.3.0 (0.2.3.0) -> pnputil /add-driver "D:\paopao\restore-20261118\packages\switchsio-0.2.3.0\switchsio.inf" /install
+[15:49:37] switchbattery  [dry-run] switchbattery-1.0.0.11 (1.0.0.11) -> pnputil /add-driver "D:\paopao\restore-20261118\packages\switchbattery-1.0.0.11\switchbattery.inf" /install
+[15:49:37] switchrtc      [dry-run] switchrtc-1.0.0.2 (1.0.0.2) -> pnputil /add-driver "D:\paopao\restore-20261118\packages\switchrtc-1.0.0.2\switchrtc.inf" /install
+[15:49:37] switchpwrbtn   [dry-run] switchpwrbtn-1.0.0.4 (1.0.0.4) -> pnputil /add-driver "D:\paopao\restore-20261118\packages\switchpwrbtn-1.0.0.4\switchpwrbtn.inf" /install
+[15:49:37] switchfan      [dry-run] switchfan-1.0.0.22 (1.0.0.22) -> pnputil /add-driver "D:\paopao\restore-20261118\packages\switchfan-1.0.0.22\switchfan.inf" /install
+[15:49:37] switchaudio    [dry-run] switchaudio-1.0.0.17 (1.0.0.17) -> pnputil /add-driver "D:\paopao\restore-20261118\packages\switchaudio-1.0.0.17\switchaudio.inf" /install
+[15:49:37] switchbt       [dry-run] switchbt-1.0.0.19 (1.0.0.19) -> pnputil /add-driver "D:\paopao\restore-20261118\packages\switchbt-1.0.0.19\switchbt.inf" /install
+[15:49:37] switchjoycon   [dry-run] switchjoycon-0.3.20.0 (0.3.20.0) -> pnputil /add-driver "D:\paopao\restore-20261118\packages\switchjoycon-0.3.20.0\switchjoycon.inf" /install
+[15:49:37] switchwifi     [dry-run] switchwifi-0.7.4.0 (0.7.4.0) -> pnputil /add-driver "D:\paopao\restore-20261118\packages\switchwifi-0.7.4.0\switchwifi.inf" /install
+[15:49:37] 
+[15:49:37] === verification ===
+[15:49:41] 
+[15:49:41] RESULT: all requested drivers installed.
+[15:49:41] log: D:\paopao\restore-20261118\install\install.log
