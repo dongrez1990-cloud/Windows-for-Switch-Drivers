@@ -3,6 +3,13 @@
 > 目标：**本地机器全丢也不怕**。这里的文件 + 你 fork 上的三条分支，足以把
 > 初代机（Erista）这台 Switch 上跑的整套东西重建回 2026-11-18 的状态：
 > Wi-Fi、蓝牙、电源管理、SD 卡、手柄（Joy-Con）、触屏、以及 UEFI 引导层。
+>
+> **上游出处**（这些实现不是本仓库原创，链接均已实测可访问）：
+> 驱动 —— https://github.com/ruje0504-2/Windows-for-Switch-Drivers ·
+> UEFI/WinX —— https://github.com/ruje0504-2/winx ·
+> GPU/Mesa —— https://github.com/ruje0504-2/mesa-switch-woa ·
+> hekate —— https://github.com/CTCaer/hekate
+> 完整清单见 [README.md](README.md) 的「上游与致谢」。
 
 ---
 

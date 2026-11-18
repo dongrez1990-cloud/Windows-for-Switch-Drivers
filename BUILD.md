@@ -2,6 +2,12 @@
 
 > 只想**装**：看 [INSTALL.md](INSTALL.md)，那里面全是现成成品，不需要编译。
 > 本文只在你要**改代码 / 造自己的签名包 / 改 UEFI** 时用。
+>
+> 上游项目与致谢见 [README.md](README.md)。本文引用的构建约定（`docs/hdh001/`、
+> 类扩展库、`SWITCH_LITE_*` 宏）都来自
+> [ruje0504-2/Windows-for-Switch-Drivers](https://github.com/ruje0504-2/Windows-for-Switch-Drivers)，
+> UEFI 部分来自 [ruje0504-2/winx](https://github.com/ruje0504-2/winx)，
+> GPU 部分来自 [ruje0504-2/mesa-switch-woa](https://github.com/ruje0504-2/mesa-switch-woa)。
 
 ---
 

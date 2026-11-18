@@ -78,7 +78,33 @@ restore-20261118/
 | switchtouch | 1.0.0.4 | | tegra210gpio / i2c | 1.0.0.4 / 1.0.0.5 |
 | nvtsdhc（SD） | 0.4.0.1 | | | |
 
+## 上游与致谢
+
+本仓库是**二次开发的分支归档**，底层工作几乎全部来自下面这些公开项目。
+**遇到驱动行为问题请先查上游文档**；本仓库只多做了一件事：**Erista（T210）适配 + 可直接安装的成品**。
+
+| 项目 | 地址 | 在本套东西里的作用 |
+|---|---|---|
+| **Windows-for-Switch-Drivers**<br>（上流主线，面向 Lite） | https://github.com/ruje0504-2/Windows-for-Switch-Drivers | **真正的上游**：全部驱动源码、`docs/hdh001/` 下的构建与上机文档。本仓库 `erista-0.7.x` 就是从它的一个快照分出来的 |
+| **winx**（UEFI / EDK2 引导层） | https://github.com/ruje0504-2/winx | WinX 固件本体：ACPI 表、`WifiBtApp`（Wi-Fi+蓝牙初始化）、`PlatformBootManagerLib`；`bl33.bin` 就从这里编译出来 |
+| **mesa-switch-woa**（GPU / 图形 / 视频） | https://github.com/ruje0504-2/mesa-switch-woa | Mesa / NVK + `tegra-x1-wddm` 的 WDDM miniport。`switchfan` 的 NVDEC 时钟耦合就在这里 |
+| **winx 的更上游**（NintendoSwitchPkg 系） | https://github.com/steck0714/winx | WinX 本身是它的分支（改用 2024 版 EDK2） |
+| **hekate**（引导器） | https://github.com/CTCaer/hekate | `firmware\hekate\hekate_ctcaer_6.5.5.bin` 是它的发布物；SD 卡 `bootloader\` 结构也来自它 |
+| **Atmosphère** | https://github.com/Atmosphere-NX/Atmosphere | 用 Atmosphère 方式引导时需要 |
+| **EDK2** | https://github.com/tianocore/edk2 | 只有自己重建 `bl33.bin` 时才需要 |
+| 原始项目（仅追溯） | `hayato41200/Windows-for-Switch-Drivers` | 上游 README 注明：共享驱动实现、SwitchCenter、SwitchPatcher 源自该项目。**该地址目前已不可访问**（账号可能改名或删除），所以只记名字、不挂死链 |
+
+> 以上除最后一条外，链接在 2026-11-18 均实测可访问。
+
 ## 许可
 
-驱动代码沿用上游 **GPL-2.0**（见各源文件 SPDX 头）；固件成品（`bl33.bin` 等）同样来自 GPL-2.0 源码，
-对应源码在 `uefi/erista` 分支与 `patches/` 里。手柄驱动与文档为作者自用工程记录。
+- **驱动 / 固件代码**：沿用上游 **GPL-2.0**（见各源文件 SPDX 头）。
+- **本仓库提供的成品二进制**（`packages\`、`firmware\`）都由上述 GPL-2.0 源码编译而来，
+  对应源码在 `erista-0.7.x`、`uefi/erista` 两个分支与 `patches\` 目录中。
+- **手柄驱动（switchjoycon）与本文档**：作者自用工程记录。
+
+## 关于本仓库的定位
+
+这是作者的**备份分支**，不是上游的替代品，也不打算合并进上游默认分支
+（`erista-0.7.x` 基于 2026-11-08 快照，相对今天的上游会缺少 SwitchFan/SwitchBattery 等新代码）。
+想参与上游开发请直接去上面第一个链接。

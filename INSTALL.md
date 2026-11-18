@@ -3,6 +3,9 @@
 > 本文只讲**怎么装**。想自己编译看 [BUILD.md](BUILD.md)；
 > 想看完整背景/灾难恢复看 [RESTORE.md](RESTORE.md)。
 >
+> **这些驱动和固件不是本仓库原创**，上游项目见 [README.md](README.md) 的「上游与致谢」一节，
+> 出问题时上游文档（尤其 `ruje0504-2/Windows-for-Switch-Drivers` 的 `docs/hdh001/`）通常更有答案。
+>
 > 目标机器实测状态（作者）：Windows 11 ARM64，Wi-Fi `Up 866.7 Mbps`，
 > 全部 13 个驱动正常，连续 5 次断连重连 + 10 轮浸泡全部自动恢复。
 
