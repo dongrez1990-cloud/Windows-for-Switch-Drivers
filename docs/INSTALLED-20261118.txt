@@ -1,25 +1,30 @@
-﻿# Installed driver manifest, 2026-11-18 (Erista / ARM64)
-# Values below were verified live over SSH during this session (pnputil /enum-drivers
-# + Get-PnpDeviceProperty). If a newer live capture exists it supersedes this file.
-
-WLAN device   : ACPI\SWOA0D01\0   "Switch Lite BCM4356 Wireless Adapter"
-WLAN status   : OK   problemCode = (none)
-WLAN driver   : 0.7.4.0  via oem52.inf     (0.7.3.0 was oem51.inf, 0.7.0.0 was oem13.inf)
-WLAN link     : Up, 866.7 Mbps, 5 GHz ch36, 802.11ac, CMCC-ZouLX-5G
-
-Driver            Version     Provider    InfName
-----------------  ----------  ----------  --------
-switchwifi        0.7.4.0     WinX        oem52.inf
-switchbt          1.0.0.19    SwitchWOA   oem15.inf
-switchfan         1.0.0.22    SwitchWOA   oem17.inf   (1.0.0.8 was oem16.inf)
-switchjoycon      0.1.1.0     SwitchWOA   oem19.inf   (0.1.0.0 was oem18.inf)
-switchsio         0.2.3.0     SwitchWOA   oem11.inf
-switchsensor      1.0.0.1     SwitchWOA   oem10.inf
-switchaudio       1.0.0.17    SwitchWOA   oem12.inf
-Tegra210Sdhc      0.4.0.1     SwitchWOA   (build\Tegra210Sdhc)
-
-Services: switchwifi Running/Manual, switchbt, switchtouch, switchfan,
-          switchaudio, switchjoycon all Running.
-
-Health at end of session: device OK (never poisoned), 5/5 disconnect-reconnect
-cycles ~2 s each and a 10/10 cycle soak, kfail=0, erp=59 kadd=34.
+﻿# Driver manifest captured live from the Switch, 2026-11-18 15:05 (Erista / ARM64)
+== WLAN ==
+instance     : ACPI\SWOA0D01\0
+status       : OK   problemCode=''
+driver       : 0.7.4.0
+adapter      : Up  866.7 Mbps  MAC 98-B6-E9-58-20-09
+report       : v=11 session=1 step=5/00000000 failure=0/00000000 scan=32/C00000B5 join=26/00000000 keys=20 add=38 del=36 eth_pre=54 eth_unknown=20 native_clear=0 native_protected=0 meta=1 rssi=0 malformed=0 filter=B/11/1/00000000 hw=9/00000000 irq=1 ring=1 select=0/2/1/2/2/0 path=170FF credits=255 erx=74 kadd=38 kfail=0 kstat=00000000 dn=36/E0 kp=19 kg=19 ev=145/0/10861 leave=0/00000000
+== signed drivers ==
+Nintendo Switch Audio            1.0.0.17       SwitchWOA     oem12.inf
+Nintendo Switch Battery          1.0.0.11       SwitchWOA     oem5.inf
+Nintendo Switch Bluetooth (UART) 1.0.0.19       SwitchWOA     oem15.inf
+Nintendo Switch Fan and Backlight Control 1.0.0.22       SwitchWOA     oem17.inf
+Nintendo Switch Light Sensor and Accelerometer 1.0.0.1        SwitchWOA     oem10.inf
+Nintendo Switch Power Button     1.0.0.4        SwitchWOA     oem3.inf
+Nintendo Switch Real-Time Clock  1.0.0.2        SwitchWOA     oem9.inf
+Nintendo Switch Touch Screen     1.0.0.4        SwitchWOA     oem2.inf
+NVIDIA Tegra210 GPIO Controller  1.0.0.4        SwitchWOA     oem0.inf
+NVIDIA Tegra210 I2C Controller   1.0.0.5        SwitchWOA     oem1.inf
+NVIDIA Tegra210 I2C Controller   1.0.0.5        SwitchWOA     oem1.inf
+NVIDIA Tegra210 I2C Controller   1.0.0.5        SwitchWOA     oem1.inf
+NVIDIA Tegra210 I2C Controller   1.0.0.5        SwitchWOA     oem1.inf
+Switch Joy-Con (Left, rail UART-C) 0.3.20.0       SwitchWOA     oem50.inf
+Switch Joy-Con (Right, rail UART-B) 0.3.20.0       SwitchWOA     oem50.inf
+Switch Lite BCM4356 Wireless Adapter 0.7.4.0        WinX          oem52.inf
+== up adapters ==
+WLAN | Switch Lite BCM4356 Wireless Adapter | 866.7 Mbps
+Tailscale | Tailscale Tunnel | 100 Gbps
+== uptime / last boot ==
+lastBoot     : 11/18/2026 08:18:13
+now          : 2026-11-18 15:05:44
