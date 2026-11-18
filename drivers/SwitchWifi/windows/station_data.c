@@ -197,10 +197,21 @@ static VOID RxComplete(void *Context, const swifi_packet_completion *Completion)
     }
     /* Native FromDS preserves its transmitter. An Ethernet completion has
      * only the authenticator SA; trust a distinct SA only on the active BSS. */
-    if ((!D->Associated || Slot->Epoch != D->Epoch) && !(Eapol && (Native || Direct))) {
+    if (!D->Associated && !(Eapol && (Native || Direct))) {
         ++D->RxDrops;
         return;
     }
+    /* RXPOST lends empty storage to firmware for the transport lifetime, so a
+     * buffer completing here may have been posted during an earlier
+     * association. Its posting-time epoch cannot describe this packet: after a
+     * reconnect that made the completion look stale and discarded the EAPOL M1
+     * that starts the 4-way handshake - the failure that required a
+     * disable/enable cycle before the station would carry traffic again.
+     * Stamp the epoch of arrival here, and leave the queued-packet guards in
+     * AdvanceRx to reject anything that crosses an association or key change. */
+    Slot->Epoch = D->Epoch;
+    Slot->KeyEpoch = D->KeyEpoch;
+    Slot->KeyInFlight = D->Pairwise || D->Group || D->KeyTx.changing;
     ReadMetadata(D, Slot, Completion->metadata_length);
     Slot->Protected = FALSE;
     Slot->DerivedClear = D->Secure && Eapol && !Native;
@@ -225,7 +236,6 @@ static VOID RxComplete(void *Context, const swifi_packet_completion *Completion)
             Slot->AcceptedKeyEpoch = D->KeyEpoch;
         }
     }
-    Slot->Epoch = D->Epoch;
     RemoveEntryList(&Slot->Link);
     Slot->State = SwifiRxReady;
     if (Eapol) Observe(D, PathQueued);
@@ -347,11 +357,10 @@ static USHORT Service(SWIFI_STATION_DATA *D)
             if (R != SWIFI_RETRY) D->FlowFault = TRUE;
             break;
         }
-        Slot->Epoch = D->Epoch;
         RemoveEntryList(&Slot->Link);
         ++Posted;
-        Slot->KeyEpoch = D->KeyEpoch;
-        Slot->KeyInFlight = D->Pairwise || D->Group || D->KeyTx.changing;
+        /* No epoch stamp here: the buffer's completion decides which
+         * association and key generation the received packet belongs to. */
         Slot->State = SwifiRxPosted;
     }
     if (Posted) Observe(D, PathPosted);

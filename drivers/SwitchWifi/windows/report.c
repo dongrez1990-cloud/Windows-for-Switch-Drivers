@@ -37,7 +37,7 @@ static VOID WriteReport(WDFWORKITEM Work)
         NTSTATUS Status = RtlStringCchPrintfW(Text, RTL_NUMBER_OF(Text),
             L"v=11 session=%u step=%u/%08X failure=%u/%08X scan=%u/%08X join=%u/%08X "
             L"keys=%u add=%u del=%u eth_pre=%u eth_unknown=%u native_clear=%u "
-            L"native_protected=%u meta=%u rssi=%u malformed=%u filter=%X/%u/%u/%08X hw=%u/%08X irq=%u ring=%u select=%X/%X/%u/%u/%u/%X path=%X credits=%u erx=%u kadd=%u kfail=%u kstat=%08X dn=%u/%X kp=%u kg=%u ev=%u/%u/%X",
+            L"native_protected=%u meta=%u rssi=%u malformed=%u filter=%X/%u/%u/%08X hw=%u/%08X irq=%u ring=%u select=%X/%X/%u/%u/%u/%X path=%X credits=%u erx=%u kadd=%u kfail=%u kstat=%08X dn=%u/%X kp=%u kg=%u ev=%u/%u/%X leave=%u/%08X",
             D.Session,D.Step,(ULONG)D.StepStatus,D.FailedStep,(ULONG)D.FailureStatus,
             D.Scans,(ULONG)D.ScanStatus,D.Attempts,(ULONG)D.JoinStatus,D.KeyMask,
             D.KeyInstalls,D.KeyRemovals,D.Count[SwifiRxEtherBeforeKey],D.Count[SwifiRxEtherUncertain],
@@ -46,7 +46,8 @@ static VOID WriteReport(WDFWORKITEM Work)
             D.FilterFlags,D.FilterCount,D.FilterMode,(ULONG)D.FilterStatus,D.HardwareStep,(ULONG)D.HardwareStatus,
             D.IrqSeen,D.RingSeen,D.Selection.Policy,D.Selection.Auth,D.Selection.Names,
             D.Selection.Offered,D.Selection.Accepted,D.Selection.Rejected,D.PacketPath,D.ReceiveCredits,
-            D.EapolFrames,D.KeyAdds,D.KeyFails,(ULONG)D.KeyStatus,D.DownEvents,D.LastDownType,D.KeyPair,D.KeyGroup,D.EvSeen,D.EvDropped,D.EvTypeMask);
+            D.EapolFrames,D.KeyAdds,D.KeyFails,(ULONG)D.KeyStatus,D.DownEvents,D.LastDownType,D.KeyPair,D.KeyGroup,D.EvSeen,D.EvDropped,D.EvTypeMask,
+            D.LeavePhase,(ULONG)D.LeaveStatus);
         if (NT_SUCCESS(Status)) {
             UNICODE_STRING Value;
             RtlInitUnicodeString(&Value, Text);
@@ -245,6 +246,20 @@ VOID SwifiReportKeyKind(SWIFI_REPORT *R, BOOLEAN Group)
     KIRQL Irql;
     KeAcquireSpinLock(&R->Lock, &Irql);
     if (Group) ++R->Data.KeyGroup; else ++R->Data.KeyPair;
+    ScheduleLocked(R);
+    KeReleaseSpinLock(&R->Lock, Irql);
+}
+
+/* Record how far a disconnect got. `leave=phase/status` is what separates a
+ * firmware that accepted the command and then lost the event (phase 2) from
+ * one that was already off the air (phase 4) and one that ignored the
+ * command outright (phase 3 readback mismatch). */
+VOID SwifiReportLeave(SWIFI_REPORT *R, SWIFI_LEAVE_PHASE Phase, NTSTATUS Status)
+{
+    KIRQL Irql;
+    KeAcquireSpinLock(&R->Lock, &Irql);
+    R->Data.LeavePhase = Phase;
+    R->Data.LeaveStatus = Status;
     ScheduleLocked(R);
     KeReleaseSpinLock(&R->Lock, Irql);
 }

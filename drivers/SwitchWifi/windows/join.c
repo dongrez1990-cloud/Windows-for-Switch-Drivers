@@ -677,9 +677,39 @@ static VOID Down(SWIFI_JOIN *J, WDI_ASSOC_STATUS Reason)
     if (!NT_SUCCESS(Status)) Poison(J, Status);
 }
 
+/* A leave timer firing only proves that no terminal firmware event arrived.
+ * It does not prove the endpoint is broken. On this hardware the radio is
+ * usually already off, and treating that as a failure is exactly what used to
+ * force a disable/enable cycle before the adapter would connect again.
+ *
+ * Ported from Lite 0.5.7 (upstream hdh001-winarm-bounded-write): ask firmware
+ * for its BSSID and let the readback decide. Confirmed down -> ordinary
+ * link-down teardown with the adapter left usable; readback failure or a link
+ * still held -> poison, which is the only case that needs recovery. */
+static VOID ConfirmLinkDown(SWIFI_JOIN *J, WDI_ASSOC_STATUS Reason, BOOLEAN DeadlineExpired)
+{
+    BOOLEAN Confirmed = FALSE;
+    if (DeadlineExpired) SwifiReportLeave(&J->Owner->Report, SwifiLeaveReadback, STATUS_PENDING);
+    if (!J->Active) {
+        /* Nothing is fenced on the wire, so there is nothing to confirm. */
+        SwifiReportLeave(&J->Owner->Report, SwifiLeaveConfirmed, STATUS_SUCCESS);
+        Down(J, Reason);
+        return;
+    }
+    NTSTATUS Status = LinkIsDown(J, &Confirmed);
+    if (NT_SUCCESS(Status) && Confirmed) {
+        SwifiReportLeave(&J->Owner->Report, SwifiLeaveConfirmed, STATUS_SUCCESS);
+        Down(J, Reason);
+    } else if (!NT_SUCCESS(Status) || DeadlineExpired) {
+        NTSTATUS Failure = NT_SUCCESS(Status) ? STATUS_IO_TIMEOUT : Status;
+        SwifiReportLeave(&J->Owner->Report, SwifiLeaveReadback, Failure);
+        Poison(J, Failure);
+    }
+}
+
 /* A BCM event has no host transaction tag. After abort/timeout keep this
- * attempt fenced until firmware confirms the disconnect. A timer expiring
- * while fenced requires endpoint recovery before another join may start. */
+ * attempt fenced until firmware confirms the disconnect, either through the
+ * event path or an authoritative BSSID query at the leave deadline. */
 static NTSTATUS BeginLeave(SWIFI_JOIN *J, USHORT Reason, NTSTATUS ConnectStatus, BOOLEAN TryNext)
 {
     if (!J->Active) return STATUS_SUCCESS;
@@ -696,9 +726,12 @@ static NTSTATUS BeginLeave(SWIFI_JOIN *J, USHORT Reason, NTSTATUS ConnectStatus,
     SwifiDataLink(J->Owner, NULL, FALSE, FALSE, FALSE);
     if (!J->Leaving) {
         KeClearEvent(&J->Left);
+        SwifiReportLeave(&J->Owner->Report, SwifiLeaveCommand, STATUS_PENDING);
         NTSTATUS Status = SwifiLeaveFirmware(J->Control, J->Active->Peer, Reason);
+        SwifiReportLeave(&J->Owner->Report, SwifiLeaveCommand, Status);
         if (!NT_SUCCESS(Status)) { Poison(J, Status); return Status; }
         J->Leaving = TRUE;
+        SwifiReportLeave(&J->Owner->Report, SwifiLeaveEvent, STATUS_PENDING);
         Arm(J, 2000);
     }
     return STATUS_SUCCESS;
@@ -710,22 +743,11 @@ static VOID JoinTimeout(WDFTIMER Timer)
     WdfWaitLockAcquire(J->Lock, NULL);
     if (J->Online && J->Deadline && KeQueryInterruptTime() >= J->Deadline) {
         if (J->Leaving) {
-            /* The disconnect event never arrived. Ask the dongle for its
-             * BSSID; if it still holds the link, deauthenticate and mark the
-             * station interface dirty. The next connect resets it. */
-            BOOLEAN Confirmed = FALSE;
-            NTSTATUS Check = STATUS_SUCCESS;
-            if (J->Active) {
-                Check = LinkIsDown(J, &Confirmed);
-                if (!NT_SUCCESS(Check) || !Confirmed)
-                    if (J->Active) (VOID)SwifiLeaveFirmware(J->Control, J->Active->Peer, 3);
-                if (NT_SUCCESS(Check) && Confirmed) Check = STATUS_SUCCESS;
-            }
-            Finish(J, &J->Leave, Check);
-            J->FirmwareDirty = TRUE;
-            JoinReset(J);
-            J->Poisoned = FALSE;
-            KeSetEvent(&J->Left, IO_NO_INCREMENT, FALSE);
+            /* The disconnect event never arrived. Missing the event is not by
+             * itself an endpoint failure: confirm against firmware, so a link
+             * that is already down finishes cleanly instead of poisoning the
+             * adapter. Only an unconfirmed readback takes the recovery path. */
+            ConfirmLinkDown(J, WDI_ASSOC_STATUS_DISASSOCIATED_BY_HOST, TRUE);
         } else (VOID)BeginLeave(J, 3, STATUS_IO_TIMEOUT, TRUE);
     }
     WdfWaitLockRelease(J->Lock);

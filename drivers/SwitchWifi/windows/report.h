@@ -24,6 +24,15 @@ typedef struct SWIFI_JOIN_SELECTION {
     ULONG Policy, Auth, Names, Offered, Accepted, Rejected;
 } SWIFI_JOIN_SELECTION;
 
+/* How far a disconnect got before the driver had to decide whether the
+ * endpoint is still healthy. Ported from Lite 0.5.7 (upstream
+ * hdh001-winarm-bounded-write), where the missing readback confirmation is
+ * what forced a disable/enable cycle after every dropped link. */
+typedef enum SWIFI_LEAVE_PHASE {
+    SwifiLeaveNone, SwifiLeaveCommand, SwifiLeaveEvent,
+    SwifiLeaveReadback, SwifiLeaveConfirmed
+} SWIFI_LEAVE_PHASE;
+
 typedef struct SWIFI_REPORT_DATA {
     ULONG Session, Step, FailedStep, HardwareStep;
     ULONG PacketPath, ReceiveCredits;
@@ -38,6 +47,8 @@ typedef struct SWIFI_REPORT_DATA {
     NTSTATUS KeyStatus;
     ULONG DownEvents, LastDownType, KeyPair, KeyGroup;
     ULONG EvSeen, EvDropped, EvTypeMask;
+    ULONG LeavePhase;
+    NTSTATUS LeaveStatus;
 } SWIFI_REPORT_DATA;
 
 typedef struct SWIFI_REPORT {
@@ -63,18 +74,7 @@ VOID SwifiReportKeyStatus(SWIFI_REPORT *R, NTSTATUS Status);
 VOID SwifiReportDown(SWIFI_REPORT *R, ULONG Type);
 VOID SwifiReportKeyKind(SWIFI_REPORT *R, BOOLEAN Group);
 VOID SwifiReportEvent(SWIFI_REPORT *R, BOOLEAN Dropped, ULONG Type);
-VOID SwifiReportEapol(SWIFI_REPORT *R);
-VOID SwifiReportKeyAttempt(SWIFI_REPORT *R);
-VOID SwifiReportKeyStatus(SWIFI_REPORT *R, NTSTATUS Status);
-VOID SwifiReportDown(SWIFI_REPORT *R, ULONG Type);
-VOID SwifiReportKeyKind(SWIFI_REPORT *R, BOOLEAN Group);
-VOID SwifiReportEvent(SWIFI_REPORT *R, BOOLEAN Dropped, ULONG Type);
-VOID SwifiReportEapol(SWIFI_REPORT *R);
-VOID SwifiReportKeyAttempt(SWIFI_REPORT *R);
-VOID SwifiReportKeyStatus(SWIFI_REPORT *R, NTSTATUS Status);
-VOID SwifiReportDown(SWIFI_REPORT *R, ULONG Type);
-VOID SwifiReportKeyKind(SWIFI_REPORT *R, BOOLEAN Group);
-VOID SwifiReportEvent(SWIFI_REPORT *R, BOOLEAN Dropped, ULONG Type);
+VOID SwifiReportLeave(SWIFI_REPORT *R, SWIFI_LEAVE_PHASE Phase, NTSTATUS Status);
 VOID SwifiReportRx(SWIFI_REPORT *R, SWIFI_RX_CASE Case);
 VOID SwifiReportFlush(SWIFI_REPORT *R);
 
