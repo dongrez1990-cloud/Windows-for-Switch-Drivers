@@ -56,4 +56,40 @@ DisableQuietBoot (
   VOID
   );
 
+#ifdef SWITCH_WIFI_RUNTIME
+/**
+  Load and start a preparation application, then patch the ACPI marker that
+  publishes its device (WifiHandoff.c).
+
+  @param[in]  Volume    Handle of the volume that holds FileName.
+  @param[in]  FileName  Path of the application, from the volume root.
+  @param[in]  Name      Four-character ACPI name whose marker is patched.
+
+  @retval EFI_SUCCESS  The application ran and the marker was patched.
+**/
+EFI_STATUS
+EFIAPI
+PrepareWindowsDevice (
+  IN EFI_HANDLE  Volume,
+  IN CHAR16      *FileName,
+  IN CONST CHAR8 Name[4]
+  );
+
+/**
+  Look for FileName on every simple file system volume and prepare it once.
+
+  @param[in]  FileName  Path of the application, from a volume root.
+  @param[in]  Name      Four-character ACPI name whose marker is patched.
+
+  @retval EFI_SUCCESS    The application was found and its device published.
+  @retval EFI_NOT_FOUND  No volume holds FileName.
+**/
+EFI_STATUS
+EFIAPI
+PrepareWindowsDeviceFromVolumes (
+  IN CHAR16       *FileName,
+  IN CONST CHAR8  Name[4]
+  );
+#endif
+
 #endif // _PLATFORM_BM_H_

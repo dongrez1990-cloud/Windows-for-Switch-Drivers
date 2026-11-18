@@ -210,57 +210,9 @@ CheckBootFile (EFI_FILE_PROTOCOL *Root, CHAR16 *Name, CONST CHAR8 *Magic, UINTN 
 }
 
 #ifdef SWITCH_WIFI_RUNTIME
-STATIC EFI_STATUS
-PrepareWindowsDevice (EFI_HANDLE Volume, CHAR16 *FileName, CONST CHAR8 Name[4])
-{
-  EFI_ACPI_2_0_ROOT_SYSTEM_DESCRIPTION_POINTER *Rsdp;
-  EFI_ACPI_DESCRIPTION_HEADER *Xsdt, *Table, *Dsdt = NULL;
-  EFI_ACPI_2_0_FIXED_ACPI_DESCRIPTION_TABLE *Fadt;
-  UINT8 Pattern[] = {0x08, 0, 0, 0, 0, 0x0A, 0x10};
-  UINT8 *Ready = NULL, *Aml, Sum = 0;
-  UINTN Entries, I, Matches = 0;
-  EFI_DEVICE_PATH_PROTOCOL *Path;
-  EFI_HANDLE Image;
-  EFI_STATUS Status;
-
-  CopyMem (Pattern + 1, Name, 4);
-  Status = EfiGetSystemConfigurationTable (&gEfiAcpi20TableGuid, (VOID **)&Rsdp);
-  if (EFI_ERROR (Status) || Rsdp == NULL || Rsdp->XsdtAddress == 0) return EFI_NOT_FOUND;
-  Xsdt = (EFI_ACPI_DESCRIPTION_HEADER *)(UINTN)Rsdp->XsdtAddress;
-  if (Xsdt->Length < sizeof (*Xsdt)) return EFI_COMPROMISED_DATA;
-  Entries = (Xsdt->Length - sizeof (*Xsdt)) / sizeof (UINT64);
-  for (I = 0; I < Entries && Dsdt == NULL; ++I) {
-    Table = (EFI_ACPI_DESCRIPTION_HEADER *)(UINTN)ReadUnaligned64 (
-        (UINT64 *)((UINT8 *)Xsdt + sizeof (*Xsdt) + I * 8));
-    if (Table->Signature != EFI_ACPI_2_0_FIXED_ACPI_DESCRIPTION_TABLE_SIGNATURE) continue;
-    if (Table->Length < sizeof (*Fadt)) return EFI_COMPROMISED_DATA;
-    Fadt = (EFI_ACPI_2_0_FIXED_ACPI_DESCRIPTION_TABLE *)Table;
-    Dsdt = (EFI_ACPI_DESCRIPTION_HEADER *)(UINTN)(Fadt->XDsdt ? Fadt->XDsdt : Fadt->Dsdt);
-  }
-  if (Dsdt == NULL || Dsdt->Length < sizeof (*Dsdt)) return EFI_NOT_FOUND;
-  Aml = (UINT8 *)Dsdt;
-  for (I = sizeof (*Dsdt); I + sizeof (Pattern) <= Dsdt->Length; ++I) {
-    if (CompareMem (Aml + I, Pattern, sizeof (Pattern)) == 0) {
-      Ready = Aml + I + 6;
-      Matches++;
-    }
-  }
-  if (Matches != 1) return EFI_NOT_FOUND;
-  Path = FileDevicePath (Volume, FileName);
-  if (Path == NULL) return EFI_OUT_OF_RESOURCES;
-  Status = gBS->LoadImage (FALSE, gImageHandle, Path, NULL, 0, &Image);
-  FreePool (Path);
-  if (EFI_ERROR (Status)) return Status;
-  Status = gBS->StartImage (Image, NULL, NULL);
-  gBS->UnloadImage (Image);
-  if (EFI_ERROR (Status)) return Status;
-  *Ready = 0x0F;
-  Dsdt->Checksum = 0;
-  for (I = 0; I < Dsdt->Length; ++I) Sum = (UINT8)(Sum + Aml[I]);
-  Dsdt->Checksum = (UINT8)(0 - Sum);
-  MemoryFence ();
-  return EFI_SUCCESS;
-}
+// PrepareWindowsDevice () lives in WifiHandoff.c and is shared with the Erista
+// BDS hook in PlatformBm.c, which boots through the normal boot options and
+// therefore has no Lite-specific volume view to prepare devices from.
 #endif
 
 STATIC EFI_STATUS

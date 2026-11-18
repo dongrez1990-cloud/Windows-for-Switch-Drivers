@@ -29,12 +29,19 @@ T214PcieSupplyEnable (T214_PCIE_SUPPLY *State)
   if (!T214PciePmicRead (0x25, &State->Config) ||
       !T214PciePmicRead (0x47, &State->Fps) ||
       !T214PciePmicRead (0x26, &State->PowerStatus) ||
-      !T214PciePmicRead (0x19, &Sd3)) return FALSE;
+      !T214PciePmicRead (0x19, &Sd3)) {
+    WifiLogF ("wifiprep: pmic read failed (ldo1/fps/pok/sd3)");
+    return FALSE;
+  }
+  WifiLogF ("wifiprep: pmic ldo1=%02x fps=%02x pok=%02x sd3=%02x", State->Config, State->Fps, State->PowerStatus, Sd3);
   State->EnabledConfig = State->Config;
   Print (L"PCIe supply: LDO1=%02x FPS=%02x POK=%02x SD3=%02x\r\n",
          State->Config, State->Fps, State->PowerStatus, Sd3);
   // SD3 also supplies audio and other I/O. It is observed, never reprogrammed.
-  if (Sd3 != 0x60) return FALSE;
+  if (Sd3 != 0x60) {
+    WifiLogF ("wifiprep: pmic SD3=%02x (B01 policy expects 60)", Sd3);
+    return FALSE;
+  }
   if (State->PowerStatus & 8) {
     UINT8 Selector = State->Config & 0x3F;
     // Preserve an already-powered 1.0-1.05 V shared XUSB/PCIe supply.
@@ -54,6 +61,7 @@ T214PcieSupplyEnable (T214_PCIE_SUPPLY *State)
   if (!T214PciePmicRead (0x25, &State->EnabledConfig)) return FALSE;
   Print (L"PCIe supply enabled: LDO1=%02x POK=%02x\r\n",
          State->EnabledConfig, State->PowerStatus);
+  WifiLogF ("wifiprep: pmic after enable ldo1=%02x pok=%02x", State->EnabledConfig, State->PowerStatus);
   return State->EnabledConfig == 0xC8 && (State->PowerStatus & 8) != 0;
 }
 

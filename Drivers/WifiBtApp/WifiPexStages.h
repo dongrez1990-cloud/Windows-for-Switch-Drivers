@@ -63,6 +63,21 @@ PexAfiErr (
        Rd (PEX_AFI, AFI_INTR_CODE), Rd (PEX_AFI, AFI_INTR_SIGNATURE));
 }
 
+// Print the root port link state; the enum steps use it to catch a link that
+// drops between two register accesses (which is what a frozen screen there means).
+STATIC
+VOID
+PexLinkAlive (
+  IN CONST CHAR16  *Tag
+  )
+{
+  UINTN   Rp = PEX_RP_BASE + PEX_PORT * 0x1000;
+  UINT32  Xp = Rd (Rp, RP_VEND_XP);
+  UINT32  Ls = Rd (Rp, RP_LINK_CTL_STATUS);
+
+  Log (L"enum: link[%s] DL_UP=%d DL_ACTIVE=%d status=%08x", Tag, (Xp >> 30) & 1U, (Ls >> 29) & 1U, Ls);
+}
+
 // ---------------------------------------------------------------------------------------------
 // pex: power + controller + link
 // ---------------------------------------------------------------------------------------------
@@ -200,8 +215,11 @@ PexBarSize (
   UINT32  Old = PexCfgRd (1, 0, 0, Where);
   UINT32  Sz;
 
+  Log (L"  size[%02x]: old=%08x", Where, Old);
   PexCfgWr (1, 0, 0, Where, 0xFFFFFFFF);
+  Log (L"  size[%02x]: wrote FFFFFFFF", Where);
   Sz = PexCfgRd (1, 0, 0, Where);
+  Log (L"  size[%02x]: readback=%08x", Where, Sz);
   PexCfgWr (1, 0, 0, Where, Old);
   return Sz;
 }
@@ -255,11 +273,18 @@ PexEnum (
     Log (L"enum: WARNING vendor is not Broadcom");
   }
   PexCfgDump (1, 0, 16);
+  PexLinkAlive (L"after-dump");
 
   Cmd = PexCfgRd (1, 0, 0, 4) & 0xFFFF;
+  Log (L"enum: [s1] command=%04x -> stop decode", Cmd);
   PexCfgWr (1, 0, 0, 4, Cmd & ~6U);
+  PexLinkAlive (L"after-decode-off");
+  Log (L"enum: [s2] sizing BAR0");
   Sz0 = PexBarSize (0x10);
+  PexLinkAlive (L"after-bar0");
+  Log (L"enum: [s3] sizing BAR2");
   Sz2 = PexBarSize (0x18);
+  PexLinkAlive (L"after-bar2");
   Log (L"enum: BAR0 sizing readback=%08x  BAR2 sizing readback=%08x (bit2:1 = 10b means 64-bit BAR)", Sz0, Sz2);
   S0 = ~(Sz0 & ~0xFU) + 1;
   S2 = ~(Sz2 & ~0xFU) + 1;
@@ -272,6 +297,7 @@ PexEnum (
     Log (L"enum: BARs do not fit the outbound memory aperture");
     return FALSE;
   }
+  Log (L"enum: [s4] program BARs and bridge window");
   Log (L"enum: BAR0 size %08x -> %08x, BAR2 size %08x -> %08x", S0, A0, S2, A2);
   PexCfgWr (1, 0, 0, 0x10, A0 | (Sz0 & 0xF));
   if ((Sz0 & 6) == 4) {
@@ -281,7 +307,9 @@ PexEnum (
   if ((Sz2 & 6) == 4) {
     PexCfgWr (1, 0, 0, 0x1C, 0);
   }
+  PexLinkAlive (L"after-bar-write");
   PexCfgWr (0, PEX_PORT + 1, 0, 0x20, BridgeWindow);
+  PexLinkAlive (L"after-window-write");
   if ((PexCfgRd (1, 0, 0, 0x10) & ~0xFU) != A0 ||
       (PexCfgRd (1, 0, 0, 0x18) & ~0xFU) != A2 ||
       (PexCfgRd (0, PEX_PORT + 1, 0, 0x20) & 0xFFF0FFF0U) != BridgeWindow) {
@@ -290,7 +318,9 @@ PexEnum (
   }
   // Enumeration only needs memory decoding. MsgInitialize or the Windows
   // driver grants bus mastering after its own DMA addresses are published.
+  Log (L"enum: [s5] enable memory decode");
   PexCfgWr (1, 0, 0, 4, (Cmd | 2U) & ~4U);
+  PexLinkAlive (L"after-decode-on");
   if ((PexCfgRd (1, 0, 0, 4) & 6U) != 2U) {
     Log (L"enum: endpoint did not accept memory decoding with DMA stopped");
     return FALSE;
@@ -333,14 +363,17 @@ PexChip (
   BOOLEAN   Parsed;
 
   mChipReady = FALSE;
+  WifiLogF ("pchip: enter");
   if (!mPexEnum) {
     Log (L"chip: run `pex` first");
     return FALSE;
   }
   mPcieMode = TRUE;
   mBpWin = 0xFFFFFFFFU;
-  if (!BpRd32 (BCM_CC_BASE, &V)) return FALSE;
+  WifiLogF ("pchip: reading chip id");
+  if (!BpRd32 (BCM_CC_BASE, &V)) { WifiLogF ("pchip: chip id read FAILED"); return FALSE; }
   mChipId = V;
+  WifiLogF ("pchip: chipid=%08x", V);
   Log (L"chip: chipid=%08x chip=%04x rev=%d pkg=%d", V, V & 0xFFFF, (V >> 16) & 0xF, (V >> 20) & 0xF);
   if ((V & 0xFFFF) != 0x4356) {
     Log (L"chip: this firmware path requires the Switch BCM4356");
@@ -351,6 +384,7 @@ PexChip (
     Log (L"chip: invalid EROM pointer");
     return FALSE;
   }
+  WifiLogF ("pchip: erom=%08x, reading 4 KiB", Erom);
   Words = AllocatePool (4096);
   if (Words == NULL) return FALSE;
   // One EROM page; the parser consumes extension words and the end marker.
@@ -360,12 +394,14 @@ PexChip (
       return FALSE;
     }
   }
+  WifiLogF ("pchip: erom read ok");
   Parsed = PexEromParse (Words, 1024, Cores, ARRAY_SIZE (Cores), &Count);
   FreePool (Words);
   if (!Parsed) {
     Log (L"chip: invalid or truncated EROM table at %08x", Erom);
     return FALSE;
   }
+  WifiLogF ("pchip: parsed cores=%u", Count);
   for (I = 0; I < Count; I++) {
     Log (L"chip: core %03x rev=%d base=%08x wrapper=%08x", Cores[I].Id,
          Cores[I].Revision, Cores[I].Base, Cores[I].Wrapper);
@@ -390,6 +426,7 @@ PexChip (
   Log (L"chip: CR4=%08x wrapper=%08x D11 wrapper=%08x PCIe=%08x rev=%d overrides=%x",
        mArmBase, mArmWrap, mD11Wrap, mPcieCore, mPcieRev, mChipOverrides);
   mSharedAddr = 0;
+  WifiLogF ("pchip: disabling D11 / resetting CR4");
   if (!CoreDisable (mD11Wrap, 0x0C, 0x04) || !CoreReset (mArmWrap, 0x20, 0x20, 0x20)) {
     Log (L"chip: could not halt D11/CR4");
     return FALSE;
@@ -415,6 +452,7 @@ PexChip (
   Log (L"chip: %d TCM banks, size=%08x, using %08x bytes at %08x", Banks, Size, mRamSize, mRamBase);
   mRamCapacity = mRamSize;
   mChipReady = TRUE;
+  WifiLogF ("pchip: OK");
   return TRUE;
 }
 

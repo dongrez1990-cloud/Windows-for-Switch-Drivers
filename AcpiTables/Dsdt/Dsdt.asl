@@ -493,7 +493,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
             Method (_STA, 0, NotSerialized) { Return (0x0F) }
         }
 #endif
-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_TOUCH)
+#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_TOUCH) || defined(SWITCH_ACPI_SWOA_TOUCH)
         // ---- Windows-for-Switch (hayato41200) SWOA devices -------------------------------
         // ACPI\SWOA0101..0801: GPIO, I2C, battery/USB-C, fan/backlight, touch, power
         // button, CPU clock, RTC. They are only useful together with the matching kernel
@@ -537,7 +537,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
         }
 
 #endif
-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_SYSTEM)
+#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_SYSTEM) || defined(SWITCH_ACPI_SWOA_BATTERY)
         // R368: hardware buttons for Windows (inbox HID button driver).
         // R369: R368 used PNP0C40, which no inbox INF on Windows 10 matches
         // (problem 28); hidinterrupt.inf binds ACPI0011 with this _DSD.
@@ -631,7 +631,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
 
 
 #endif
-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_TOUCH)
+#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_TOUCH) || defined(SWITCH_ACPI_SWOA_TOUCH)
         // R373: I2C3 (GEN3_I2C) for the touch panel. UEFI R373 powers the
         // panel (LDO6 2.9 V, reset PJ7 high) and enables the I2C3 clock.
         Device (I2C3)
@@ -651,7 +651,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
         }
 
 #endif
-#ifdef SWITCH_ACPI_SWOA_ENABLE
+#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_ACPI_SWOA_SENSOR)
         // R379: I2C2 (GEN2_I2C, 0x7000C400) for the BH1730FVC light sensor. UEFI R379 clocks it.
         Device (I2C2)
         {
@@ -742,7 +742,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
 #ifdef SWITCH_LITE_SIO
 #include "t214/Sio.asl"
 #endif
-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_BLUETOOTH)
+#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_BLUETOOTH) || defined(SWITCH_ACPI_SWOA_BLUETOOTH)
         // R390 (hayato41200/Windows-for-Switch): Bluetooth for switchbt.sys (ACPI\SWOA0B01).
         // BCM4356A3 on UART-D (GIC SPI 90 = GSI 122, level high). UEFI R390 sets the pins,
         // clocks the UART and powers the chip (PH4). Lite uses the same wiring;
@@ -764,7 +764,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
         }
 
 #endif
-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_TOUCH)
+#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_TOUCH) || defined(SWITCH_ACPI_SWOA_TOUCH)
         // R373: STM FTM4 touch controller (ACPI\SWOA0501), 0x49 on I2C3,
         // interrupt PX1 (GPIO 185) level low.
         Device (TCH0)
@@ -789,7 +789,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
         }
 
 #endif
-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_AUDIO)
+#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_AUDIO) || defined(SWITCH_ACPI_SWOA_AUDIO)
         // R402: audio for switchaudio.sys (ACPI\SWOA0C01). AHUB (ADMAIF, XBAR,
         // I2S1 at 0x702D1000), ADMA, and the ALC5639 codec on I2C1. UEFI turns
         // on the APE clocks, sets up the codec and starts I2S1.
@@ -814,7 +814,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
         }
 
 #endif
-#ifdef SWITCH_ACPI_SWOA_ENABLE
+#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_ACPI_SWOA_CPUCLOCK)
         // R375: CPU clock control for switchcpu.sys (ACPI\SWOA0701). CAR window
         // (PLLX, CCLK burst policy), MAX77621 VDD_CPU on I2C5, TMP451 on I2C1
         // (shared with the fan driver) for the thermal guard.
@@ -836,7 +836,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
         }
 
 #endif
-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_SYSTEM)
+#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_SYSTEM) || defined(SWITCH_ACPI_SWOA_RTC)
         // R377: real-time clock for switchrtc.sys (ACPI\SWOA0801). MAX77620 RTC
         // block at I2C5 0x68. The driver only reads it and keeps its own offset,
         // so the time Horizon keeps in the RTC is left alone.
@@ -859,7 +859,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
         }
 #endif
 
-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_POWER)
+#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_POWER) || defined(SWITCH_ACPI_SWOA_POWER)
         Device (I2C5)
         {
             Name (_HID, "SWOA0201")
@@ -896,7 +896,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
 #endif
 
 
-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_FAN)
+#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_FAN) || defined(SWITCH_ACPI_SWOA_FAN)
         // TMP451 temperature sensor bus. Firmware enables I2C1 before Windows.
         Device (I2C1)
         {

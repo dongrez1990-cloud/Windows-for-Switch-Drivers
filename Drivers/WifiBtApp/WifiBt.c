@@ -1487,6 +1487,7 @@ StepOff (
   PexOff ();
 }
 
+#include "WifiLog.h"   // checkpoint log to \SwitchWOA\Wifi\wifiprep.log
 #include "WifiPexStages.h"
 #include "WifiMsgbuf.h"
 #include "WifiScan.h"
@@ -1549,9 +1550,12 @@ RunWifiBt (
     }
   }
 
-  if (EFI_ERROR (ShellOpenFileByName (L"wifibt.log", &mLog, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
-    mLog = NULL;
-  } else {
+  if (EFI_ERROR (ShellOpenFileByName (L"\\SwitchWOA\\Wifi\\wifibt.log", &mLog, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
+    if (EFI_ERROR (ShellOpenFileByName (L"wifibt.log", &mLog, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
+      mLog = NULL;
+    }
+  }
+  if (mLog != NULL) {
     UINT64  End = 0;
     ShellGetFileSize (mLog, &End);
     ShellSetFilePosition (mLog, End);

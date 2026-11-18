@@ -585,6 +585,22 @@ PlatformBootManagerAfterConsole (
   //
   EfiBootManagerConnectAll ();
 
+#if defined (SWITCH_WIFI_RUNTIME) && defined (SWITCH_WIFI_ERISTA)
+  //
+  // Erista has no Lite Home boot path: Windows is started from a boot option,
+  // so the PCIe radio has to be prepared here, before any of them runs. The
+  // application is expected at \SwitchWOA\Wifi\WifiPrepare.efi on the FAT32
+  // ESP (the volume UEFI reads without an NTFS driver). A failure only leaves
+  // the WFI0 device hidden and must never stop Windows from booting.
+  //
+  Status = PrepareWindowsDeviceFromVolumes (L"\\SwitchWOA\\Wifi\\WifiPrepare.efi", "WSTA");
+  if (EFI_ERROR (Status)) {
+    Print (L"Wi-Fi preparation: %r; device hidden, continuing boot.\r\n", Status);
+  } else {
+    Print (L"Wi-Fi preparation: PCIe radio ready, WFI0 published.\r\n");
+  }
+#endif
+
   Status = gBS->LocateProtocol (&gEsrtManagementProtocolGuid, NULL,
                   (VOID **)&EsrtManagement);
   if (!EFI_ERROR (Status)) {

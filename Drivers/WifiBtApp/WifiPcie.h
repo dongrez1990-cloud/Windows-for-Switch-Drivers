@@ -483,6 +483,8 @@ PexCfgRd (
   )
 {
   UINT32  Off;
+  UINT32  V;
+  UINTN   Try;
 
   if (Bus == 0) {
     if (Dev != (PEX_PORT + 1U) || Fn != 0) {
@@ -491,9 +493,23 @@ PexCfgRd (
     return Rd (PEX_RP_BASE + PEX_PORT * 0x1000, Where & 0xFFC);
   }
   Off = ((Where & 0xF00U) << 16) | (Bus << 16) | (Dev << 11) | (Fn << 8) | (Where & 0xFF);
-  Wr (PEX_AFI, AFI_FPCI_BAR0, 0xFE100000U + ((Off & ~0xFFFU) >> 8));
-  (VOID)Rd (PEX_AFI, AFI_FPCI_BAR0);
-  return Rd (PEX_CS, Off & 0xFFC);
+  // The FPCI window needs a settle cycle between the BAR0 arm write and the
+  // config read: back-to-back reads can come back 0xFFFFFFFF even though the
+  // endpoint answered the previous one (observed on Erista: alternating
+  // 0xFFFFFFFF / real data in one dump). Retry a few times before believing
+  // "unsupported request".
+  V = 0xFFFFFFFF;
+  for (Try = 0; Try < 3; Try++) {
+    Wr (PEX_AFI, AFI_FPCI_BAR0, 0xFE100000U + ((Off & ~0xFFFU) >> 8));
+    (VOID)Rd (PEX_AFI, AFI_FPCI_BAR0);
+    Us (1);
+    V = Rd (PEX_CS, Off & 0xFFC);
+    if (V != 0xFFFFFFFF) {
+      break;
+    }
+    Us (10);
+  }
+  return V;
 }
 
 STATIC
@@ -517,6 +533,7 @@ PexCfgWr (
   Off = ((Where & 0xF00U) << 16) | (Bus << 16) | (Dev << 11) | (Fn << 8) | (Where & 0xFF);
   Wr (PEX_AFI, AFI_FPCI_BAR0, 0xFE100000U + ((Off & ~0xFFFU) >> 8));
   (VOID)Rd (PEX_AFI, AFI_FPCI_BAR0);
+  Us (1);
   Wr (PEX_CS, Off & 0xFFC, V);
 }
 

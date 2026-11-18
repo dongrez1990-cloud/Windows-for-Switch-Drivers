@@ -18,6 +18,7 @@
   WifiScan.h
   t214/uphy.h
   t214/power.h
+  t210/power.h
 
 [Packages]
   MdePkg/MdePkg.dec
