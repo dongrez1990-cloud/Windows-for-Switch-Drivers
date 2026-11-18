@@ -40,9 +40,27 @@ if (-not $OutDir) { $OutDir = Join-Path $Repo 'build\SwitchWifi' }
 # The 22621 kit cannot build this driver at all: its WiFiCx 1.0 predates
 # WIFI_STATION_CAPABILITIES_INIT and the RSNA AKM fields of
 # WDI_CONNECT_PARAMETERS_CONTAINER. 26100 is the kit the driver was written for.
-$NdisPatch = Join-Path (Split-Path $Repo -Parent) "tools\wdk-patch\$($Wdk.Split('.')[2])"
-if (-not (Test-Path (Join-Path $NdisPatch 'ndis.h'))) {
-  & (Join-Path (Split-Path $Repo -Parent) 'tools\Patch-NdisHeader.ps1') -WdkVersion $Wdk
+#
+# The NDIS version-argument patch exists only for kits older than 26100, where the
+# header pastes macro arguments with ## and clang refuses the literal token. 26100
+# already routes them through an intermediate macro, so a clean checkout of this
+# repository builds with no generated header and nothing from outside the tree.
+$KitBuild = [int]$Wdk.Split('.')[2]
+$NdisPatched = $KitBuild -lt 26100
+$NdisPatch = Join-Path (Split-Path $Repo -Parent) "tools\wdk-patch\$KitBuild"
+if ($NdisPatched) {
+  if (-not (Test-Path (Join-Path $NdisPatch 'ndis.h'))) {
+    # The script ships in this repository; the parent-directory copy is kept as a
+    # fallback for an existing build host that predates it.
+    $patchScript = @(
+      (Join-Path $PSScriptRoot 'Patch-NdisHeader.ps1'),
+      (Join-Path (Split-Path $Repo -Parent) 'tools\Patch-NdisHeader.ps1')
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $patchScript) {
+      throw "WDK $Wdk needs tools\Patch-NdisHeader.ps1, which was not found in this repository."
+    }
+    & $patchScript -WdkVersion $Wdk
+  }
 }
 
 $sources = @(
@@ -81,9 +99,9 @@ $build = @{
   ExtraIncludes = $includes
   Inf2CatOs    = @('10_NI_ARM64')   # the INF decorates NTarm64.10.0...22621
 }
-# Only pass the shadow path when a patched copy actually exists (it does not for
-# kits >= 26100, which already expand the NDIS version arguments correctly).
-if (Test-Path (Join-Path $NdisPatch 'ndis.h')) { $build.IncludePaths = @($NdisPatch) }
+# Only pass the shadow path for a kit that actually needed the patch; a stale
+# wdk-patch directory left by an older kit must never shadow a newer header.
+if ($NdisPatched -and (Test-Path (Join-Path $NdisPatch 'ndis.h'))) { $build.IncludePaths = @($NdisPatch) }
 if ($NoSign) { $build.NoSign = $true }
 
 & (Join-Path $PSScriptRoot 'Build-Driver.ps1') @build
