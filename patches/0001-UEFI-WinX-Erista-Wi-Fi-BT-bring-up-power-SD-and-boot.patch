@@ -1,0 +1,1257 @@
+From e6e04f3309ee7b2059d71909019a3adae6e2528c Mon Sep 17 00:00:00 2001
+From: dongrez1990-cloud <dongrez1990-cloud@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 15:12:41 +0800
+Subject: [PATCH] UEFI (WinX): Erista Wi-Fi/BT bring-up, power, SD and boot
+ handoff
+
+Work that was sitting uncommitted in this tree:
+
+- Drivers/WifiBtApp: Wi-Fi+BT bring-up for the original Switch (Erista). New
+  t210/ stage headers, WifiLog.h, rebuilt PCIe/PHY stage tables (WifiPexStages.h,
+  WifiPcie.h), WifiPrepare.h/.inf hookups.
+- Library/PlatformBootManagerLib: new WifiHandoff.c so the UEFI stage hands the
+  firmware RSS/CLM state to the Windows driver instead of leaving the station
+  half-open; PlatformBm.c/.h/.inf wiring and LiteHomeBoot.c cleanup.
+- Drivers/SdMmcDxe/SdMmc.c: SD path changes.
+- AcpiTables/Dsdt/Dsdt.asl + WifiBtApp/t214/power.h: ACPI/power table updates.
+- NintendoSwitch.dsc: platform description now builds the above.
+
+Verified on hardware: Windows on Switch (Erista) reaches the desktop and the
+Wi-Fi station connects; driver-side detail is in the Windows-for-Switch-Drivers
+branch erista-0.7.x.
+---
+ AcpiTables/Dsdt/Dsdt.asl                      |  22 +-
+ Drivers/SdMmcDxe/SdMmc.c                      |  57 ++++-
+ Drivers/WifiBtApp/WifiBt.c                    |  10 +-
+ Drivers/WifiBtApp/WifiLog.h                   |  83 +++++++
+ Drivers/WifiBtApp/WifiPcie.h                  |  23 +-
+ Drivers/WifiBtApp/WifiPexStages.h             |  40 +++-
+ Drivers/WifiBtApp/WifiPrepare.h               |  61 +++++-
+ Drivers/WifiBtApp/WifiPrepare.inf             |   1 +
+ Drivers/WifiBtApp/t210/power.h                |  85 ++++++++
+ Drivers/WifiBtApp/t214/power.h                |  12 +-
+ Library/PlatformBootManagerLib/LiteHomeBoot.c |  54 +----
+ Library/PlatformBootManagerLib/PlatformBm.c   |  16 ++
+ Library/PlatformBootManagerLib/PlatformBm.h   |  36 ++++
+ .../PlatformBootManagerLib.inf                |   1 +
+ Library/PlatformBootManagerLib/WifiHandoff.c  | 203 ++++++++++++++++++
+ NintendoSwitch.dsc                            |  19 +-
+ 16 files changed, 637 insertions(+), 86 deletions(-)
+ create mode 100644 Drivers/WifiBtApp/WifiLog.h
+ create mode 100644 Drivers/WifiBtApp/t210/power.h
+ create mode 100644 Library/PlatformBootManagerLib/WifiHandoff.c
+
+diff --git a/AcpiTables/Dsdt/Dsdt.asl b/AcpiTables/Dsdt/Dsdt.asl
+index f4f7552..94294ec 100644
+--- a/AcpiTables/Dsdt/Dsdt.asl
++++ b/AcpiTables/Dsdt/Dsdt.asl
+@@ -493,7 +493,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
+             Method (_STA, 0, NotSerialized) { Return (0x0F) }
+         }
+ #endif
+-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_TOUCH)
++#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_TOUCH) || defined(SWITCH_ACPI_SWOA_TOUCH)
+         // ---- Windows-for-Switch (hayato41200) SWOA devices -------------------------------
+         // ACPI\SWOA0101..0801: GPIO, I2C, battery/USB-C, fan/backlight, touch, power
+         // button, CPU clock, RTC. They are only useful together with the matching kernel
+@@ -537,7 +537,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
+         }
+ 
+ #endif
+-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_SYSTEM)
++#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_SYSTEM) || defined(SWITCH_ACPI_SWOA_BATTERY)
+         // R368: hardware buttons for Windows (inbox HID button driver).
+         // R369: R368 used PNP0C40, which no inbox INF on Windows 10 matches
+         // (problem 28); hidinterrupt.inf binds ACPI0011 with this _DSD.
+@@ -631,7 +631,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
+ 
+ 
+ #endif
+-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_TOUCH)
++#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_TOUCH) || defined(SWITCH_ACPI_SWOA_TOUCH)
+         // R373: I2C3 (GEN3_I2C) for the touch panel. UEFI R373 powers the
+         // panel (LDO6 2.9 V, reset PJ7 high) and enables the I2C3 clock.
+         Device (I2C3)
+@@ -651,7 +651,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
+         }
+ 
+ #endif
+-#ifdef SWITCH_ACPI_SWOA_ENABLE
++#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_ACPI_SWOA_SENSOR)
+         // R379: I2C2 (GEN2_I2C, 0x7000C400) for the BH1730FVC light sensor. UEFI R379 clocks it.
+         Device (I2C2)
+         {
+@@ -742,7 +742,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
+ #ifdef SWITCH_LITE_SIO
+ #include "t214/Sio.asl"
+ #endif
+-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_BLUETOOTH)
++#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_BLUETOOTH) || defined(SWITCH_ACPI_SWOA_BLUETOOTH)
+         // R390 (hayato41200/Windows-for-Switch): Bluetooth for switchbt.sys (ACPI\SWOA0B01).
+         // BCM4356A3 on UART-D (GIC SPI 90 = GSI 122, level high). UEFI R390 sets the pins,
+         // clocks the UART and powers the chip (PH4). Lite uses the same wiring;
+@@ -764,7 +764,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
+         }
+ 
+ #endif
+-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_TOUCH)
++#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_TOUCH) || defined(SWITCH_ACPI_SWOA_TOUCH)
+         // R373: STM FTM4 touch controller (ACPI\SWOA0501), 0x49 on I2C3,
+         // interrupt PX1 (GPIO 185) level low.
+         Device (TCH0)
+@@ -789,7 +789,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
+         }
+ 
+ #endif
+-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_AUDIO)
++#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_AUDIO) || defined(SWITCH_ACPI_SWOA_AUDIO)
+         // R402: audio for switchaudio.sys (ACPI\SWOA0C01). AHUB (ADMAIF, XBAR,
+         // I2S1 at 0x702D1000), ADMA, and the ALC5639 codec on I2C1. UEFI turns
+         // on the APE clocks, sets up the codec and starts I2S1.
+@@ -814,7 +814,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
+         }
+ 
+ #endif
+-#ifdef SWITCH_ACPI_SWOA_ENABLE
++#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_ACPI_SWOA_CPUCLOCK)
+         // R375: CPU clock control for switchcpu.sys (ACPI\SWOA0701). CAR window
+         // (PLLX, CCLK burst policy), MAX77621 VDD_CPU on I2C5, TMP451 on I2C1
+         // (shared with the fan driver) for the thermal guard.
+@@ -836,7 +836,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
+         }
+ 
+ #endif
+-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_SYSTEM)
++#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_SYSTEM) || defined(SWITCH_ACPI_SWOA_RTC)
+         // R377: real-time clock for switchrtc.sys (ACPI\SWOA0801). MAX77620 RTC
+         // block at I2C5 0x68. The driver only reads it and keeps its own offset,
+         // so the time Horizon keeps in the RTC is left alone.
+@@ -859,7 +859,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
+         }
+ #endif
+ 
+-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_POWER)
++#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_POWER) || defined(SWITCH_ACPI_SWOA_POWER)
+         Device (I2C5)
+         {
+             Name (_HID, "SWOA0201")
+@@ -896,7 +896,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
+ #endif
+ 
+ 
+-#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_FAN)
++#if defined(SWITCH_ACPI_SWOA_ENABLE) || defined(SWITCH_LITE_FAN) || defined(SWITCH_ACPI_SWOA_FAN)
+         // TMP451 temperature sensor bus. Firmware enables I2C1 before Windows.
+         Device (I2C1)
+         {
+diff --git a/Drivers/SdMmcDxe/SdMmc.c b/Drivers/SdMmcDxe/SdMmc.c
+index f5a93dc..7638b6b 100644
+--- a/Drivers/SdMmcDxe/SdMmc.c
++++ b/Drivers/SdMmcDxe/SdMmc.c
+@@ -240,6 +240,7 @@ SdPowerOn (
+     // Deep loopback for the CLK pad so reads work.
+     MmioWrite32 (APB_MISC_SDMMC1_CLK_LPBK, 1);
+ 
++#ifdef SWITCH_LITE_BOOT_SD
+     // T210B01 uses Schmitt inputs on all six pins and no pull-down on CLK.
+     UINT32 SdInput = PINMUX_DRIVE_2X_V | PINMUX_INPUT_ENABLE_V | (1U << 12);
+     MmioWrite32 (PINMUX_SDMMC1_CLK, SdInput);
+@@ -249,6 +250,18 @@ SdPowerOn (
+     gpio_config (GPIO_PORT_M, 0x3F, GPIO_MODE_SPIO);
+     gpio_write (GPIO_PORT_M, 0x3F, GPIO_LOW);
+     gpio_output_enable (GPIO_PORT_M, 0x3F, GPIO_OUTPUT_DISABLE);
++#else
++    // SDMMC1 pad pinmux (T210: CLK pulled down, others pulled up).
++    MmioWrite32 (PINMUX_SDMMC1_CLK,  PINMUX_DRIVE_2X_V | PINMUX_INPUT_ENABLE_V | PINMUX_PULL_DOWN_V);
++    MmioWrite32 (PINMUX_SDMMC1_CMD,  PINMUX_DRIVE_2X_V | PINMUX_INPUT_ENABLE_V | PINMUX_PULL_UP_V);
++    MmioWrite32 (PINMUX_SDMMC1_DAT3, PINMUX_DRIVE_2X_V | PINMUX_INPUT_ENABLE_V | PINMUX_PULL_UP_V);
++    MmioWrite32 (PINMUX_SDMMC1_DAT2, PINMUX_DRIVE_2X_V | PINMUX_INPUT_ENABLE_V | PINMUX_PULL_UP_V);
++    MmioWrite32 (PINMUX_SDMMC1_DAT1, PINMUX_DRIVE_2X_V | PINMUX_INPUT_ENABLE_V | PINMUX_PULL_UP_V);
++    MmioWrite32 (PINMUX_SDMMC1_DAT0, PINMUX_DRIVE_2X_V | PINMUX_INPUT_ENABLE_V | PINMUX_PULL_UP_V);
++    // Pads M0..M5 back to their special function (hekate leaves them as discharge GPIOs).
++    gpio_output_enable (GPIO_PORT_M, 0x3F, GPIO_OUTPUT_DISABLE);
++    gpio_config (GPIO_PORT_M, 0x3F, GPIO_MODE_SPIO);
++#endif
+ 
+     // Make sure the SDMMC1 IO power domain is powered.
+     MmioOr32  (PMC_NO_IOPOWER, PMC_SDMMC1_BIT);
+@@ -272,7 +285,13 @@ SdPowerOn (
+     }
+     udelay (1000);
+ 
+-
++#ifdef SWITCH_LITE_BOOT_SD
++#else
++    // Pad slew codes for a clean clock (T210).
++    MmioWrite32 (APB_MISC_SDMMC1_PADCTRL, (MmioRead32 (APB_MISC_SDMMC1_PADCTRL) & 0x0FFFFFFF) | 0x50000000);
++    (VOID) MmioRead32 (APB_MISC_SDMMC1_PADCTRL);
++    udelay (1000);
++#endif
+ }
+ 
+ // Vendor/pad setup that has to follow a controller "reset all" (hekate sdmmc_init()).
+@@ -288,12 +307,22 @@ SdVendorInit (
+ 
+     MmioOr32  (SD_BASE + SD_IOSPARE, (1U << 19));                      // 1 cycle delayed cmd_oen
+     MmioAnd32 (SD_BASE + SD_VENIOTRIMCTL, ~(1U << 2));                  // band gap VREG supplies the DLL
++#ifdef SWITCH_LITE_BOOT_SD
+     MmioAnd32 (SD_BASE + 0x1C0, ~(1U << 17)); // Use the software-selected tap.
+     V = MmioRead32 (SD_BASE + SD_VENCLKCTL);
+     // T210B01 SDMMC1 at 3.3 V (Hekate sdmmc_init / _sdmmc_config_tap_val).
+     MmioWrite32 (SD_BASE + SD_VENCLKCTL, (V & 0xE000FFFB) | (14U << 24) | (11U << 16));
+     MmioAnd32 (SD_BASE + SD_SDMEMCMPPADCTL, ~0xFU);  // VREF_SEL = 0
+     MmioAnd32 (SD_BASE + SD_AUTOCALCFG, 0xFFFF8080); // PU/PD offsets zero at 3.3 V
++#else
++    V = MmioRead32 (SD_BASE + SD_VENCLKCTL);
++    MmioWrite32 (SD_BASE + SD_VENCLKCTL, (V & 0xE0FFFFFB) | (2U << 24)); // trim value (T210, SDMMC1)
++    V = MmioRead32 (SD_BASE + SD_SDMEMCMPPADCTL);
++    MmioWrite32 (SD_BASE + SD_SDMEMCMPPADCTL, (V & ~0xFU) | 7);          // vref_sel = 7
++    // Auto-cal offsets for 3.3 V on T210: pd = -3, pu = 0.
++    V = MmioRead32 (SD_BASE + SD_AUTOCALCFG);
++    MmioWrite32 (SD_BASE + SD_AUTOCALCFG, (V & 0xFFFF8080) | (0x7DU << 8));
++#endif
+ 
+     // Pad auto calibration.
+     ClkWasOn = (MmioRead16 (SD_BASE + 0x2C) & (1U << 2)) != 0;
+@@ -312,7 +341,11 @@ SdVendorInit (
+         // Calibration failed: load the suggested standard 3.3 V 50 ohm values.
+         MmioAnd32 (SD_BASE + SD_AUTOCALCFG, ~(1U << 29));
+         V = MmioRead32 (APB_MISC_SDMMC1_PADCTRL) & 0xF8080FFF;
++#ifdef SWITCH_LITE_BOOT_SD
+         MmioWrite32 (APB_MISC_SDMMC1_PADCTRL, V | (0x808U << 12));
++#else
++        MmioWrite32 (APB_MISC_SDMMC1_PADCTRL, V | (0xC0CU << 12));
++#endif
+         SdLog (L"[SDDIAG] autocal TIMEOUT (fallback pad cfg)\r\n");
+     }
+     SdLog (L"[SDDIAG] autocal sts=%08x cfg=%08x padctl=%08x\r\n",
+@@ -973,12 +1006,21 @@ SdControllerProbe
+ 	ZeroMem(&mConfig, sizeof(MMC_CONFIG));
+ 
+     // Set configuration
++#ifdef SWITCH_LITE_BOOT_SD
+     mConfig.voltages = MMC_VDD_32_33 | MMC_VDD_33_34;
+     mConfig.host_caps = 0;
+-	
++
+     // bus-width = <4>;
+     mConfig.host_caps |= MMC_MODE_4BIT;
+     // Use default-speed SD signalling for the first Lite mount.
++#else
++    mConfig.voltages = MMC_VDD_32_33 | MMC_VDD_33_34 | MMC_VDD_165_195;
++    mConfig.host_caps = 0;
++
++    // bus-width = <4>;
++    mConfig.host_caps |= MMC_MODE_4BIT;
++    mConfig.host_caps |= MMC_MODE_HS_52MHz | MMC_MODE_HS;
++#endif
+ 
+     /*
+ 	 * min freq is for card identification, and is the highest
+@@ -987,7 +1029,11 @@ SdControllerProbe
+ 	 *  (actually 52MHz)
+ 	 */
+ 	mConfig.f_min = 375000;
++#ifdef SWITCH_LITE_BOOT_SD
+ 	mConfig.f_max = 25000000;
++#else
++	mConfig.f_max = 48000000;
++#endif
+ 
+ 	mConfig.b_max = CONFIG_SYS_MMC_MAX_BLK_COUNT;
+ 
+@@ -1041,10 +1087,15 @@ SdMmcDxeInitialize
+     UINTN Attempt;
+     int ret;
+ 
+-    // The Lite card calibration below is specific to Tegra210B01.
++#ifdef SWITCH_LITE_BOOT_SD
++    // The Lite card calibration below is specific to Tegra210B01. Without this
++    // guard a non-B01 console would run B01 pad/tap values; with it the Lite
++    // profile stays B01-only. Erista builds take the T210 values instead (see
++    // SdPowerOn / SdVendorInit / SdControllerProbe).
+     if ((MmioRead32 (SD_APB_MISC_BASE + 0x804) & 0xFFF0) != 0x2120) {
+         return EFI_UNSUPPORTED;
+     }
++#endif
+ 
+     // Print the collected [SDDIAG] lines just before the boot manager runs.
+     gBS->CreateEventEx (
+diff --git a/Drivers/WifiBtApp/WifiBt.c b/Drivers/WifiBtApp/WifiBt.c
+index c039568..130a7b9 100644
+--- a/Drivers/WifiBtApp/WifiBt.c
++++ b/Drivers/WifiBtApp/WifiBt.c
+@@ -1487,6 +1487,7 @@ StepOff (
+   PexOff ();
+ }
+ 
++#include "WifiLog.h"   // checkpoint log to \SwitchWOA\Wifi\wifiprep.log
+ #include "WifiPexStages.h"
+ #include "WifiMsgbuf.h"
+ #include "WifiScan.h"
+@@ -1549,9 +1550,12 @@ RunWifiBt (
+     }
+   }
+ 
+-  if (EFI_ERROR (ShellOpenFileByName (L"wifibt.log", &mLog, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
+-    mLog = NULL;
+-  } else {
++  if (EFI_ERROR (ShellOpenFileByName (L"\\SwitchWOA\\Wifi\\wifibt.log", &mLog, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
++    if (EFI_ERROR (ShellOpenFileByName (L"wifibt.log", &mLog, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
++      mLog = NULL;
++    }
++  }
++  if (mLog != NULL) {
+     UINT64  End = 0;
+     ShellGetFileSize (mLog, &End);
+     ShellSetFilePosition (mLog, End);
+diff --git a/Drivers/WifiBtApp/WifiLog.h b/Drivers/WifiBtApp/WifiLog.h
+new file mode 100644
+index 0000000..d3e1c54
+--- /dev/null
++++ b/Drivers/WifiBtApp/WifiLog.h
+@@ -0,0 +1,83 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Checkpoint log for the Wi-Fi preparation path.
++ *
++ * The firmware's exception handler can only draw a register dump on the panel
++ * and halt, which a photograph cannot resolve into a call site. This writes the
++ * progress of each step to \SwitchWOA\Wifi\wifiprep.log on the first volume
++ * that accepts it, flushing after every line: whatever the last line is, that
++ * is the step that killed the machine.
++ *
++ * Include before WifiPexStages.h (PexChip logs its sub-steps) and it is also
++ * visible to WifiPrepare.h, which is included later in the same translation
++ * unit.
++ */
++#ifndef WIFI_LOG_H
++#define WIFI_LOG_H
++
++STATIC EFI_FILE_PROTOCOL *mWifiLogFile = NULL;
++STATIC BOOLEAN            mWifiLogTried = FALSE;
++
++/* Not STATIC-only for readability: this file is included once. */
++STATIC VOID
++WifiLogOpen (
++  VOID
++  )
++{
++  EFI_HANDLE                        *Handles = NULL;
++  UINTN                              Count = 0;
++  UINTN                              Index;
++  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL   *Fs;
++  EFI_FILE_PROTOCOL                 *Root;
++  EFI_FILE_PROTOCOL                 *File;
++
++  if (mWifiLogTried) return;
++  mWifiLogTried = TRUE;
++
++  if (EFI_ERROR (gBS->LocateHandleBuffer (ByProtocol, &gEfiSimpleFileSystemProtocolGuid,
++                                          NULL, &Count, &Handles))) {
++    return;
++  }
++
++  for (Index = 0; Index < Count; Index++) {
++    if (EFI_ERROR (gBS->HandleProtocol (Handles[Index], &gEfiSimpleFileSystemProtocolGuid,
++                                        (VOID **)&Fs))) continue;
++    if (EFI_ERROR (Fs->OpenVolume (Fs, &Root))) continue;
++    if (!EFI_ERROR (Root->Open (Root, &File, L"\\SwitchWOA\\Wifi\\wifiprep.log",
++                                EFI_FILE_MODE_CREATE | EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0))) {
++      mWifiLogFile = File;
++      /* EFI_FILE_PROTOCOL::SetPosition with MAX_UINT64 seeks to end of file. */
++      File->SetPosition (File, 0xFFFFFFFFFFFFFFFFULL);
++      break;
++    }
++    Root->Close (Root);
++  }
++  gBS->FreePool (Handles);
++}
++
++STATIC VOID
++WifiLogF (
++  IN CONST CHAR8  *Format,
++  ...
++  )
++{
++  VA_LIST  Marker;
++  CHAR8    Buffer[200];
++  UINTN    Length;
++
++  VA_START (Marker, Format);
++  Length = AsciiVSPrint (Buffer, sizeof (Buffer) - 3, Format, Marker);
++  VA_END (Marker);
++
++  if (!mWifiLogTried) WifiLogOpen ();
++  if (mWifiLogFile == NULL) return;
++
++  if (Length > sizeof (Buffer) - 3) Length = sizeof (Buffer) - 3;
++  Buffer[Length++] = '\r';
++  Buffer[Length++] = '\n';
++  mWifiLogFile->Write (mWifiLogFile, &Length, Buffer);
++  mWifiLogFile->Flush (mWifiLogFile);
++}
++
++
++
++#endif
+diff --git a/Drivers/WifiBtApp/WifiPcie.h b/Drivers/WifiBtApp/WifiPcie.h
+index cacbedb..300addc 100644
+--- a/Drivers/WifiBtApp/WifiPcie.h
++++ b/Drivers/WifiBtApp/WifiPcie.h
+@@ -483,6 +483,8 @@ PexCfgRd (
+   )
+ {
+   UINT32  Off;
++  UINT32  V;
++  UINTN   Try;
+ 
+   if (Bus == 0) {
+     if (Dev != (PEX_PORT + 1U) || Fn != 0) {
+@@ -491,9 +493,23 @@ PexCfgRd (
+     return Rd (PEX_RP_BASE + PEX_PORT * 0x1000, Where & 0xFFC);
+   }
+   Off = ((Where & 0xF00U) << 16) | (Bus << 16) | (Dev << 11) | (Fn << 8) | (Where & 0xFF);
+-  Wr (PEX_AFI, AFI_FPCI_BAR0, 0xFE100000U + ((Off & ~0xFFFU) >> 8));
+-  (VOID)Rd (PEX_AFI, AFI_FPCI_BAR0);
+-  return Rd (PEX_CS, Off & 0xFFC);
++  // The FPCI window needs a settle cycle between the BAR0 arm write and the
++  // config read: back-to-back reads can come back 0xFFFFFFFF even though the
++  // endpoint answered the previous one (observed on Erista: alternating
++  // 0xFFFFFFFF / real data in one dump). Retry a few times before believing
++  // "unsupported request".
++  V = 0xFFFFFFFF;
++  for (Try = 0; Try < 3; Try++) {
++    Wr (PEX_AFI, AFI_FPCI_BAR0, 0xFE100000U + ((Off & ~0xFFFU) >> 8));
++    (VOID)Rd (PEX_AFI, AFI_FPCI_BAR0);
++    Us (1);
++    V = Rd (PEX_CS, Off & 0xFFC);
++    if (V != 0xFFFFFFFF) {
++      break;
++    }
++    Us (10);
++  }
++  return V;
+ }
+ 
+ STATIC
+@@ -517,6 +533,7 @@ PexCfgWr (
+   Off = ((Where & 0xF00U) << 16) | (Bus << 16) | (Dev << 11) | (Fn << 8) | (Where & 0xFF);
+   Wr (PEX_AFI, AFI_FPCI_BAR0, 0xFE100000U + ((Off & ~0xFFFU) >> 8));
+   (VOID)Rd (PEX_AFI, AFI_FPCI_BAR0);
++  Us (1);
+   Wr (PEX_CS, Off & 0xFFC, V);
+ }
+ 
+diff --git a/Drivers/WifiBtApp/WifiPexStages.h b/Drivers/WifiBtApp/WifiPexStages.h
+index b6bf935..b229459 100644
+--- a/Drivers/WifiBtApp/WifiPexStages.h
++++ b/Drivers/WifiBtApp/WifiPexStages.h
+@@ -63,6 +63,21 @@ PexAfiErr (
+        Rd (PEX_AFI, AFI_INTR_CODE), Rd (PEX_AFI, AFI_INTR_SIGNATURE));
+ }
+ 
++// Print the root port link state; the enum steps use it to catch a link that
++// drops between two register accesses (which is what a frozen screen there means).
++STATIC
++VOID
++PexLinkAlive (
++  IN CONST CHAR16  *Tag
++  )
++{
++  UINTN   Rp = PEX_RP_BASE + PEX_PORT * 0x1000;
++  UINT32  Xp = Rd (Rp, RP_VEND_XP);
++  UINT32  Ls = Rd (Rp, RP_LINK_CTL_STATUS);
++
++  Log (L"enum: link[%s] DL_UP=%d DL_ACTIVE=%d status=%08x", Tag, (Xp >> 30) & 1U, (Ls >> 29) & 1U, Ls);
++}
++
+ // ---------------------------------------------------------------------------------------------
+ // pex: power + controller + link
+ // ---------------------------------------------------------------------------------------------
+@@ -200,8 +215,11 @@ PexBarSize (
+   UINT32  Old = PexCfgRd (1, 0, 0, Where);
+   UINT32  Sz;
+ 
++  Log (L"  size[%02x]: old=%08x", Where, Old);
+   PexCfgWr (1, 0, 0, Where, 0xFFFFFFFF);
++  Log (L"  size[%02x]: wrote FFFFFFFF", Where);
+   Sz = PexCfgRd (1, 0, 0, Where);
++  Log (L"  size[%02x]: readback=%08x", Where, Sz);
+   PexCfgWr (1, 0, 0, Where, Old);
+   return Sz;
+ }
+@@ -255,11 +273,18 @@ PexEnum (
+     Log (L"enum: WARNING vendor is not Broadcom");
+   }
+   PexCfgDump (1, 0, 16);
++  PexLinkAlive (L"after-dump");
+ 
+   Cmd = PexCfgRd (1, 0, 0, 4) & 0xFFFF;
++  Log (L"enum: [s1] command=%04x -> stop decode", Cmd);
+   PexCfgWr (1, 0, 0, 4, Cmd & ~6U);
++  PexLinkAlive (L"after-decode-off");
++  Log (L"enum: [s2] sizing BAR0");
+   Sz0 = PexBarSize (0x10);
++  PexLinkAlive (L"after-bar0");
++  Log (L"enum: [s3] sizing BAR2");
+   Sz2 = PexBarSize (0x18);
++  PexLinkAlive (L"after-bar2");
+   Log (L"enum: BAR0 sizing readback=%08x  BAR2 sizing readback=%08x (bit2:1 = 10b means 64-bit BAR)", Sz0, Sz2);
+   S0 = ~(Sz0 & ~0xFU) + 1;
+   S2 = ~(Sz2 & ~0xFU) + 1;
+@@ -272,6 +297,7 @@ PexEnum (
+     Log (L"enum: BARs do not fit the outbound memory aperture");
+     return FALSE;
+   }
++  Log (L"enum: [s4] program BARs and bridge window");
+   Log (L"enum: BAR0 size %08x -> %08x, BAR2 size %08x -> %08x", S0, A0, S2, A2);
+   PexCfgWr (1, 0, 0, 0x10, A0 | (Sz0 & 0xF));
+   if ((Sz0 & 6) == 4) {
+@@ -281,7 +307,9 @@ PexEnum (
+   if ((Sz2 & 6) == 4) {
+     PexCfgWr (1, 0, 0, 0x1C, 0);
+   }
++  PexLinkAlive (L"after-bar-write");
+   PexCfgWr (0, PEX_PORT + 1, 0, 0x20, BridgeWindow);
++  PexLinkAlive (L"after-window-write");
+   if ((PexCfgRd (1, 0, 0, 0x10) & ~0xFU) != A0 ||
+       (PexCfgRd (1, 0, 0, 0x18) & ~0xFU) != A2 ||
+       (PexCfgRd (0, PEX_PORT + 1, 0, 0x20) & 0xFFF0FFF0U) != BridgeWindow) {
+@@ -290,7 +318,9 @@ PexEnum (
+   }
+   // Enumeration only needs memory decoding. MsgInitialize or the Windows
+   // driver grants bus mastering after its own DMA addresses are published.
++  Log (L"enum: [s5] enable memory decode");
+   PexCfgWr (1, 0, 0, 4, (Cmd | 2U) & ~4U);
++  PexLinkAlive (L"after-decode-on");
+   if ((PexCfgRd (1, 0, 0, 4) & 6U) != 2U) {
+     Log (L"enum: endpoint did not accept memory decoding with DMA stopped");
+     return FALSE;
+@@ -333,14 +363,17 @@ PexChip (
+   BOOLEAN   Parsed;
+ 
+   mChipReady = FALSE;
++  WifiLogF ("pchip: enter");
+   if (!mPexEnum) {
+     Log (L"chip: run `pex` first");
+     return FALSE;
+   }
+   mPcieMode = TRUE;
+   mBpWin = 0xFFFFFFFFU;
+-  if (!BpRd32 (BCM_CC_BASE, &V)) return FALSE;
++  WifiLogF ("pchip: reading chip id");
++  if (!BpRd32 (BCM_CC_BASE, &V)) { WifiLogF ("pchip: chip id read FAILED"); return FALSE; }
+   mChipId = V;
++  WifiLogF ("pchip: chipid=%08x", V);
+   Log (L"chip: chipid=%08x chip=%04x rev=%d pkg=%d", V, V & 0xFFFF, (V >> 16) & 0xF, (V >> 20) & 0xF);
+   if ((V & 0xFFFF) != 0x4356) {
+     Log (L"chip: this firmware path requires the Switch BCM4356");
+@@ -351,6 +384,7 @@ PexChip (
+     Log (L"chip: invalid EROM pointer");
+     return FALSE;
+   }
++  WifiLogF ("pchip: erom=%08x, reading 4 KiB", Erom);
+   Words = AllocatePool (4096);
+   if (Words == NULL) return FALSE;
+   // One EROM page; the parser consumes extension words and the end marker.
+@@ -360,12 +394,14 @@ PexChip (
+       return FALSE;
+     }
+   }
++  WifiLogF ("pchip: erom read ok");
+   Parsed = PexEromParse (Words, 1024, Cores, ARRAY_SIZE (Cores), &Count);
+   FreePool (Words);
+   if (!Parsed) {
+     Log (L"chip: invalid or truncated EROM table at %08x", Erom);
+     return FALSE;
+   }
++  WifiLogF ("pchip: parsed cores=%u", Count);
+   for (I = 0; I < Count; I++) {
+     Log (L"chip: core %03x rev=%d base=%08x wrapper=%08x", Cores[I].Id,
+          Cores[I].Revision, Cores[I].Base, Cores[I].Wrapper);
+@@ -390,6 +426,7 @@ PexChip (
+   Log (L"chip: CR4=%08x wrapper=%08x D11 wrapper=%08x PCIe=%08x rev=%d overrides=%x",
+        mArmBase, mArmWrap, mD11Wrap, mPcieCore, mPcieRev, mChipOverrides);
+   mSharedAddr = 0;
++  WifiLogF ("pchip: disabling D11 / resetting CR4");
+   if (!CoreDisable (mD11Wrap, 0x0C, 0x04) || !CoreReset (mArmWrap, 0x20, 0x20, 0x20)) {
+     Log (L"chip: could not halt D11/CR4");
+     return FALSE;
+@@ -415,6 +452,7 @@ PexChip (
+   Log (L"chip: %d TCM banks, size=%08x, using %08x bytes at %08x", Banks, Size, mRamSize, mRamBase);
+   mRamCapacity = mRamSize;
+   mChipReady = TRUE;
++  WifiLogF ("pchip: OK");
+   return TRUE;
+ }
+ 
+diff --git a/Drivers/WifiBtApp/WifiPrepare.h b/Drivers/WifiBtApp/WifiPrepare.h
+index 048eecc..5931c7a 100644
+--- a/Drivers/WifiBtApp/WifiPrepare.h
++++ b/Drivers/WifiBtApp/WifiPrepare.h
+@@ -3,37 +3,75 @@
+  * No host DMA allocation survives this application. Windows loads the radio
+  * firmware after it owns the ACPI device, registers and interrupt. */
+ #include "t214/power.h"
++#include "t210/power.h"
+ #include "../../WindowsDrivers/drivers/SwitchWifi/platform/tegra_resources.h"
+ 
+ EFI_STATUS EFIAPI
+ WifiPrepareMain (EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
+ {
+   T214_PCIE_SUPPLY Supply;
++  ERISTA_PCIE_SUPPLY ESupply;
+   UINT32 AfiAsid = 0, LicClass = 0, LicEnabled = 0;
+   BOOLEAN AfiChanged = FALSE, LicChanged = FALSE, Started = FALSE;
+   (VOID)ImageHandle;
+   (VOID)SystemTable;
+   ZeroMem (&Supply, sizeof (Supply));
+-  if (!PexIsB01 ()) return EFI_UNSUPPORTED;
++  ZeroMem (&ESupply, sizeof (ESupply));
++  WifiLogF ("==== wifiprep start soc=%08x ====", MmioRead32 (0x70000804UL));
++  WifiLogF ("wifiprep: [0] supply (%a)", PexIsB01 () ? "B01" : "T210");
++  // Both boards use the MAX77620 on I2C5. B01 programs the Lite-validated
++  // LDO1/SD3 profile; Erista uses those same rails plus the LDO7 reference,
++  // which is only observed (see t210/power.h). The Erista helper is tolerant:
++  // a failed rail probe keeps hekate's state and the bring-up goes on.
+   i2c_init (I2C_5);
+-  if (!T214PcieSupplyEnable (&Supply)) goto Failed;
++  if (PexIsB01 ()) {
++    if (!T214PcieSupplyEnable (&Supply)) goto Failed;
++  } else {
++    EristaPcieSupplyEnable (&ESupply);
++  }
+   Started = TRUE;
+-  if (!PexUp () || !PexEnum ()) goto Failed;
++  WifiLogF ("wifiprep: [0] supply done");
++  Log (L"wifiprep: [1] pex up + enum ...");
++  if (!PexUp () || !PexEnum ()) {
++    Log (L"wifiprep: [1] PexUp/PexEnum FAILED");
++    goto Failed;
++  }
++  WifiLogF ("wifiprep: [1] pex up + enum OK");
++  Log (L"wifiprep: [1] ok, BAR0=%08x size=%08x BAR2=%08x size=%08x",
++       (UINT32)mBar0, mBar0Size, (UINT32)mBar2, mBar2Size);
+ 
+   // PexEnum left memory decoding on and verified that endpoint DMA is off.
+-  if (!PexChip () || !BpWr32 (mPcieCore + 0x4C, 0)) goto Failed;
++  Log (L"wifiprep: [2] PexChip (BAR0 window, chip id, EROM, CR4) ...");
++  if (!PexChip ()) {
++    Log (L"wifiprep: [2] PexChip FAILED");
++    goto Failed;
++  }
++  Log (L"wifiprep: [2] PexChip ok, halting bus mastering");
++  if (!BpWr32 (mPcieCore + 0x4C, 0)) {
++    Log (L"wifiprep: [2] bus-master halt write FAILED");
++    goto Failed;
++  }
++  Log (L"wifiprep: [2] ok");
++  WifiLogF ("wifiprep: [2] PexChip OK");
+ 
+   // This platform has no Windows Tegra SMMU/IORT driver. Establish a direct
+   // AFI DMA domain while bus mastering is off; Windows uses 32-bit HAL DMA
+   // logical addresses and uncached/noncoherent common buffers (_CCA=0).
+   // Other SMMU clients are untouched. Failure restores the inherited domain.
++  Log (L"wifiprep: [3] AFI DMA domain ...");
+   AfiAsid = MmioRead32 (0x70019238UL);
+   AfiChanged = TRUE;
+   MmioWrite32 (0x70019238UL, 0);
+-  if (MmioRead32 (0x70019238UL) != 0) goto Failed;
++  if (MmioRead32 (0x70019238UL) != 0) {
++    Log (L"wifiprep: [3] AFI asid did not clear");
++    goto Failed;
++  }
++  Log (L"wifiprep: [3] ok (asid was %08x)", AfiAsid);
++  WifiLogF ("wifiprep: [3] AFI OK");
+   // Switchroot irq-tegra.c unmasks the legacy controller as well as GIC.
+   // Windows owns the GIC; prepare only SPI 98's CPU route while AFI and the
+   // endpoint remain masked. Preserve all other IRQ/FIQ routing bits.
++  Log (L"wifiprep: [4] LIC SPI 98 route ...");
+   LicClass = MmioRead32 (SWIFI_LIC_BASE + 0x2C);
+   LicEnabled = MmioRead32 (SWIFI_LIC_BASE + 0x20);
+   LicChanged = TRUE;
+@@ -41,11 +79,17 @@ WifiPrepareMain (EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
+   MmioWrite32 (SWIFI_LIC_BASE + 0x1C, SWIFI_LIC_MASK); // Clear stale forced IRQ.
+   MmioWrite32 (SWIFI_LIC_BASE + 0x24, SWIFI_LIC_MASK); // CPU_IER_SET.
+   if (!(MmioRead32 (SWIFI_LIC_BASE + 0x20) & SWIFI_LIC_MASK) ||
+-      (MmioRead32 (SWIFI_LIC_BASE + 0x2C) & SWIFI_LIC_MASK)) goto Failed;
++      (MmioRead32 (SWIFI_LIC_BASE + 0x2C) & SWIFI_LIC_MASK)) {
++    Log (L"wifiprep: [4] LIC route readback wrong");
++    goto Failed;
++  }
++  Log (L"wifiprep: [4] ok");
++  WifiLogF ("wifiprep: [4] LIC OK");
+   MemoryFence ();
+   Log (L"Windows Wi-Fi handoff: PCIe ready, CR4 halted, bus mastering/interrupts off");
+   Log (L"BAR0=%08x size=%08x BAR2=%08x size=%08x; Windows owns firmware and DMA",
+        (UINT32)mBar0, mBar0Size, (UINT32)mBar2, mBar2Size);
++  WifiLogF ("wifiprep: SUCCESS, handing to Windows");
+   return EFI_SUCCESS; // Keep the LDO1/PHY/link prepared for the Windows owner.
+ 
+ Failed:
+@@ -59,11 +103,12 @@ Failed:
+     MmioWrite32 (0x70019238UL, AfiAsid);
+     MemoryFence ();
+   }
+-  if (Supply.Changed) {
++  if (PexIsB01 () ? Supply.Changed : ESupply.Shared.Changed) {
+     MmioWrite32 (0x60006310UL, BIT10);
+     MicroSecondDelay (20);
+   }
+-  if (!T214PcieSupplyRestore (&Supply))
++  if (PexIsB01 () ? !T214PcieSupplyRestore (&Supply)
++                  : !EristaPcieSupplyRestore (&ESupply))
+     Log (L"Windows Wi-Fi preparation: supply restore failed");
+   return EFI_DEVICE_ERROR;
+ }
+diff --git a/Drivers/WifiBtApp/WifiPrepare.inf b/Drivers/WifiBtApp/WifiPrepare.inf
+index 8051adc..a6d78a3 100644
+--- a/Drivers/WifiBtApp/WifiPrepare.inf
++++ b/Drivers/WifiBtApp/WifiPrepare.inf
+@@ -18,6 +18,7 @@
+   WifiScan.h
+   t214/uphy.h
+   t214/power.h
++  t210/power.h
+ 
+ [Packages]
+   MdePkg/MdePkg.dec
+diff --git a/Drivers/WifiBtApp/t210/power.h b/Drivers/WifiBtApp/t210/power.h
+new file mode 100644
+index 0000000..6930cd7
+--- /dev/null
++++ b/Drivers/WifiBtApp/t210/power.h
+@@ -0,0 +1,85 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* T210 "Erista" PCIe supply policy.
++ *
++ * Reference: switchroot tegra210-odin-common.dtsi
++ *   avdd-pll-uerefe-supply = <&max77620_ldo7>;   <-- B01 uses ldo1 here
++ *   hvddio-pex-supply      = <&max77620_sd3>;
++ *   dvddio-pex-supply      = <&max77620_ldo1>;
++ *   dvdd-pex-pll-supply    = <&max77620_ldo1>;
++ *   hvdd-pex-pll-e-supply  = <&max77620_sd3>;
++ *   vddio-pex-ctl-supply   = <&max77620_sd3>;
++ *
++ * LDO1 and SD3 are the same rails as the B01 profile that has already been
++ * accepted on hardware, so the proven T214PcieSupplyEnable()/Restore() sequence
++ * is reused rather than duplicated. The single Erista difference is
++ * avdd-pll-uerefe on LDO7, which BL31/Hekate normally leaves enabled; this file
++ * only OBSERVES it and reports it. That is what separates "the PLL never locked
++ * because its reference rail was cold" from a lane/UPHY problem on a first
++ * bring-up, without writing a rail whose exact enable sequence has not been
++ * verified on this board.
++ *
++ * MAX77620 register names are from Include/Device/Max77620.h:
++ *   LDO7_CFG 0x31, LDO7_CFG2 0x32, FPS_LDO7 0x4D, LDO1_CFG 0x25, FPS_LDO1 0x47.
++ * Copyright (c) 2016 NVIDIA CORPORATION. All rights reserved.
++ */
++#ifndef WIFI_T210_POWER_H
++#define WIFI_T210_POWER_H
++
++#include "../t214/power.h"   /* shared LDO1/SD3 policy + PMIC access helpers */
++
++#define MAX77620_LDO7_CFG    0x31
++#define MAX77620_LDO7_CFG2   0x32
++#define MAX77620_FPS_LDO7    0x4D
++#define MAX77620_FPS_ENFPS_SW_MASK 0x01
++
++typedef struct {
++  T214_PCIE_SUPPLY Shared;    /* LDO1/SD3, programmed exactly as on B01 */
++  UINT8 Ldo7Cfg;              /* observed only, never written */
++  UINT8 Ldo7Cfg2;
++  UINT8 Ldo7Fps;
++} ERISTA_PCIE_SUPPLY;
++
++STATIC BOOLEAN
++EristaPcieSupplyEnable (ERISTA_PCIE_SUPPLY *State)
++{
++  ZeroMem (&State->Shared, sizeof (State->Shared));
++  State->Ldo7Cfg = 0xFF;
++  State->Ldo7Cfg2 = 0xFF;
++  State->Ldo7Fps = 0xFF;
++
++  // Diagnostic only: a read failure must not abort the bring-up, because the
++  // rail may legitimately be owned by BL31/Hekate.
++  if (T214PciePmicRead (MAX77620_LDO7_CFG, &State->Ldo7Cfg) &&
++      T214PciePmicRead (MAX77620_LDO7_CFG2, &State->Ldo7Cfg2) &&
++      T214PciePmicRead (MAX77620_FPS_LDO7, &State->Ldo7Fps)) {
++    WifiLogF ("wifiprep: supply ldo7 cfg=%02x cfg2=%02x fps=%02x", State->Ldo7Cfg, State->Ldo7Cfg2, State->Ldo7Fps);
++    Print (L"PCIe supply: LDO7(avdd-pll-uerefe) cfg=%02x cfg2=%02x fps=%02x%s (Erista)\r\n",
++           State->Ldo7Cfg, State->Ldo7Cfg2, State->Ldo7Fps,
++           (State->Ldo7Fps & MAX77620_FPS_ENFPS_SW_MASK) ? L" enabled" : L"");
++  } else {
++    WifiLogF ("wifiprep: supply ldo7 unreadable");
++    Print (L"PCIe supply: LDO7 unreadable; continuing with LDO1/SD3 only\r\n");
++  }
++
++  // LDO1 (dvddio-pex / dvdd-pex-pll) plus observed SD3 (hvddio-pex /
++  // vddio-pex-ctl) are the same rails as B01, so reuse the accepted sequence.
++  // A failure here is NOT fatal on Erista: hekate already leaves LDO1/SD3 in
++  // the PCIe state, and the shell test (wifibt pex) shows the link trains and
++  // the endpoint enumerates without this programming at all. Hiding the WIFI
++  // device over a PMIC probe would block the whole Windows path.
++  if (!T214PcieSupplyEnable (&State->Shared)) {
++    WifiLogF ("wifiprep: supply programming failed; keeping the hekate state");
++    (VOID)T214PcieSupplyRestore (&State->Shared);
++  } else {
++    WifiLogF ("wifiprep: supply programmed (LDO1/SD3)");
++  }
++  return TRUE;
++}
++
++STATIC BOOLEAN
++EristaPcieSupplyRestore (ERISTA_PCIE_SUPPLY *State)
++{
++  // Only LDO1 is ever changed, so the shared restore is the whole restore.
++  return T214PcieSupplyRestore (&State->Shared);
++}
++#endif
+diff --git a/Drivers/WifiBtApp/t214/power.h b/Drivers/WifiBtApp/t214/power.h
+index 46755e6..8a41cba 100644
+--- a/Drivers/WifiBtApp/t214/power.h
++++ b/Drivers/WifiBtApp/t214/power.h
+@@ -29,12 +29,19 @@ T214PcieSupplyEnable (T214_PCIE_SUPPLY *State)
+   if (!T214PciePmicRead (0x25, &State->Config) ||
+       !T214PciePmicRead (0x47, &State->Fps) ||
+       !T214PciePmicRead (0x26, &State->PowerStatus) ||
+-      !T214PciePmicRead (0x19, &Sd3)) return FALSE;
++      !T214PciePmicRead (0x19, &Sd3)) {
++    WifiLogF ("wifiprep: pmic read failed (ldo1/fps/pok/sd3)");
++    return FALSE;
++  }
++  WifiLogF ("wifiprep: pmic ldo1=%02x fps=%02x pok=%02x sd3=%02x", State->Config, State->Fps, State->PowerStatus, Sd3);
+   State->EnabledConfig = State->Config;
+   Print (L"PCIe supply: LDO1=%02x FPS=%02x POK=%02x SD3=%02x\r\n",
+          State->Config, State->Fps, State->PowerStatus, Sd3);
+   // SD3 also supplies audio and other I/O. It is observed, never reprogrammed.
+-  if (Sd3 != 0x60) return FALSE;
++  if (Sd3 != 0x60) {
++    WifiLogF ("wifiprep: pmic SD3=%02x (B01 policy expects 60)", Sd3);
++    return FALSE;
++  }
+   if (State->PowerStatus & 8) {
+     UINT8 Selector = State->Config & 0x3F;
+     // Preserve an already-powered 1.0-1.05 V shared XUSB/PCIe supply.
+@@ -54,6 +61,7 @@ T214PcieSupplyEnable (T214_PCIE_SUPPLY *State)
+   if (!T214PciePmicRead (0x25, &State->EnabledConfig)) return FALSE;
+   Print (L"PCIe supply enabled: LDO1=%02x POK=%02x\r\n",
+          State->EnabledConfig, State->PowerStatus);
++  WifiLogF ("wifiprep: pmic after enable ldo1=%02x pok=%02x", State->EnabledConfig, State->PowerStatus);
+   return State->EnabledConfig == 0xC8 && (State->PowerStatus & 8) != 0;
+ }
+ 
+diff --git a/Library/PlatformBootManagerLib/LiteHomeBoot.c b/Library/PlatformBootManagerLib/LiteHomeBoot.c
+index 9a7baa8..f5bf856 100644
+--- a/Library/PlatformBootManagerLib/LiteHomeBoot.c
++++ b/Library/PlatformBootManagerLib/LiteHomeBoot.c
+@@ -210,57 +210,9 @@ CheckBootFile (EFI_FILE_PROTOCOL *Root, CHAR16 *Name, CONST CHAR8 *Magic, UINTN
+ }
+ 
+ #ifdef SWITCH_WIFI_RUNTIME
+-STATIC EFI_STATUS
+-PrepareWindowsDevice (EFI_HANDLE Volume, CHAR16 *FileName, CONST CHAR8 Name[4])
+-{
+-  EFI_ACPI_2_0_ROOT_SYSTEM_DESCRIPTION_POINTER *Rsdp;
+-  EFI_ACPI_DESCRIPTION_HEADER *Xsdt, *Table, *Dsdt = NULL;
+-  EFI_ACPI_2_0_FIXED_ACPI_DESCRIPTION_TABLE *Fadt;
+-  UINT8 Pattern[] = {0x08, 0, 0, 0, 0, 0x0A, 0x10};
+-  UINT8 *Ready = NULL, *Aml, Sum = 0;
+-  UINTN Entries, I, Matches = 0;
+-  EFI_DEVICE_PATH_PROTOCOL *Path;
+-  EFI_HANDLE Image;
+-  EFI_STATUS Status;
+-
+-  CopyMem (Pattern + 1, Name, 4);
+-  Status = EfiGetSystemConfigurationTable (&gEfiAcpi20TableGuid, (VOID **)&Rsdp);
+-  if (EFI_ERROR (Status) || Rsdp == NULL || Rsdp->XsdtAddress == 0) return EFI_NOT_FOUND;
+-  Xsdt = (EFI_ACPI_DESCRIPTION_HEADER *)(UINTN)Rsdp->XsdtAddress;
+-  if (Xsdt->Length < sizeof (*Xsdt)) return EFI_COMPROMISED_DATA;
+-  Entries = (Xsdt->Length - sizeof (*Xsdt)) / sizeof (UINT64);
+-  for (I = 0; I < Entries && Dsdt == NULL; ++I) {
+-    Table = (EFI_ACPI_DESCRIPTION_HEADER *)(UINTN)ReadUnaligned64 (
+-        (UINT64 *)((UINT8 *)Xsdt + sizeof (*Xsdt) + I * 8));
+-    if (Table->Signature != EFI_ACPI_2_0_FIXED_ACPI_DESCRIPTION_TABLE_SIGNATURE) continue;
+-    if (Table->Length < sizeof (*Fadt)) return EFI_COMPROMISED_DATA;
+-    Fadt = (EFI_ACPI_2_0_FIXED_ACPI_DESCRIPTION_TABLE *)Table;
+-    Dsdt = (EFI_ACPI_DESCRIPTION_HEADER *)(UINTN)(Fadt->XDsdt ? Fadt->XDsdt : Fadt->Dsdt);
+-  }
+-  if (Dsdt == NULL || Dsdt->Length < sizeof (*Dsdt)) return EFI_NOT_FOUND;
+-  Aml = (UINT8 *)Dsdt;
+-  for (I = sizeof (*Dsdt); I + sizeof (Pattern) <= Dsdt->Length; ++I) {
+-    if (CompareMem (Aml + I, Pattern, sizeof (Pattern)) == 0) {
+-      Ready = Aml + I + 6;
+-      Matches++;
+-    }
+-  }
+-  if (Matches != 1) return EFI_NOT_FOUND;
+-  Path = FileDevicePath (Volume, FileName);
+-  if (Path == NULL) return EFI_OUT_OF_RESOURCES;
+-  Status = gBS->LoadImage (FALSE, gImageHandle, Path, NULL, 0, &Image);
+-  FreePool (Path);
+-  if (EFI_ERROR (Status)) return Status;
+-  Status = gBS->StartImage (Image, NULL, NULL);
+-  gBS->UnloadImage (Image);
+-  if (EFI_ERROR (Status)) return Status;
+-  *Ready = 0x0F;
+-  Dsdt->Checksum = 0;
+-  for (I = 0; I < Dsdt->Length; ++I) Sum = (UINT8)(Sum + Aml[I]);
+-  Dsdt->Checksum = (UINT8)(0 - Sum);
+-  MemoryFence ();
+-  return EFI_SUCCESS;
+-}
++// PrepareWindowsDevice () lives in WifiHandoff.c and is shared with the Erista
++// BDS hook in PlatformBm.c, which boots through the normal boot options and
++// therefore has no Lite-specific volume view to prepare devices from.
+ #endif
+ 
+ STATIC EFI_STATUS
+diff --git a/Library/PlatformBootManagerLib/PlatformBm.c b/Library/PlatformBootManagerLib/PlatformBm.c
+index f3d7a59..8dcd11c 100644
+--- a/Library/PlatformBootManagerLib/PlatformBm.c
++++ b/Library/PlatformBootManagerLib/PlatformBm.c
+@@ -585,6 +585,22 @@ PlatformBootManagerAfterConsole (
+   //
+   EfiBootManagerConnectAll ();
+ 
++#if defined (SWITCH_WIFI_RUNTIME) && defined (SWITCH_WIFI_ERISTA)
++  //
++  // Erista has no Lite Home boot path: Windows is started from a boot option,
++  // so the PCIe radio has to be prepared here, before any of them runs. The
++  // application is expected at \SwitchWOA\Wifi\WifiPrepare.efi on the FAT32
++  // ESP (the volume UEFI reads without an NTFS driver). A failure only leaves
++  // the WFI0 device hidden and must never stop Windows from booting.
++  //
++  Status = PrepareWindowsDeviceFromVolumes (L"\\SwitchWOA\\Wifi\\WifiPrepare.efi", "WSTA");
++  if (EFI_ERROR (Status)) {
++    Print (L"Wi-Fi preparation: %r; device hidden, continuing boot.\r\n", Status);
++  } else {
++    Print (L"Wi-Fi preparation: PCIe radio ready, WFI0 published.\r\n");
++  }
++#endif
++
+   Status = gBS->LocateProtocol (&gEsrtManagementProtocolGuid, NULL,
+                   (VOID **)&EsrtManagement);
+   if (!EFI_ERROR (Status)) {
+diff --git a/Library/PlatformBootManagerLib/PlatformBm.h b/Library/PlatformBootManagerLib/PlatformBm.h
+index 0a3c626..9ab8ca1 100644
+--- a/Library/PlatformBootManagerLib/PlatformBm.h
++++ b/Library/PlatformBootManagerLib/PlatformBm.h
+@@ -56,4 +56,40 @@ DisableQuietBoot (
+   VOID
+   );
+ 
++#ifdef SWITCH_WIFI_RUNTIME
++/**
++  Load and start a preparation application, then patch the ACPI marker that
++  publishes its device (WifiHandoff.c).
++
++  @param[in]  Volume    Handle of the volume that holds FileName.
++  @param[in]  FileName  Path of the application, from the volume root.
++  @param[in]  Name      Four-character ACPI name whose marker is patched.
++
++  @retval EFI_SUCCESS  The application ran and the marker was patched.
++**/
++EFI_STATUS
++EFIAPI
++PrepareWindowsDevice (
++  IN EFI_HANDLE  Volume,
++  IN CHAR16      *FileName,
++  IN CONST CHAR8 Name[4]
++  );
++
++/**
++  Look for FileName on every simple file system volume and prepare it once.
++
++  @param[in]  FileName  Path of the application, from a volume root.
++  @param[in]  Name      Four-character ACPI name whose marker is patched.
++
++  @retval EFI_SUCCESS    The application was found and its device published.
++  @retval EFI_NOT_FOUND  No volume holds FileName.
++**/
++EFI_STATUS
++EFIAPI
++PrepareWindowsDeviceFromVolumes (
++  IN CHAR16       *FileName,
++  IN CONST CHAR8  Name[4]
++  );
++#endif
++
+ #endif // _PLATFORM_BM_H_
+diff --git a/Library/PlatformBootManagerLib/PlatformBootManagerLib.inf b/Library/PlatformBootManagerLib/PlatformBootManagerLib.inf
+index 21b0139..c57e658 100644
+--- a/Library/PlatformBootManagerLib/PlatformBootManagerLib.inf
++++ b/Library/PlatformBootManagerLib/PlatformBootManagerLib.inf
+@@ -34,6 +34,7 @@
+ [Sources]
+   PlatformBm.c
+   LiteHomeBoot.c
++  WifiHandoff.c
+ 
+ [Packages]
+   MdeModulePkg/MdeModulePkg.dec
+diff --git a/Library/PlatformBootManagerLib/WifiHandoff.c b/Library/PlatformBootManagerLib/WifiHandoff.c
+new file mode 100644
+index 0000000..4eb1b80
+--- /dev/null
++++ b/Library/PlatformBootManagerLib/WifiHandoff.c
+@@ -0,0 +1,203 @@
++/** @file
++  Windows Wi-Fi handoff: run WifiPrepare.efi, then publish the ACPI device.
++
++  The Lite Home boot path (LiteHomeBoot.c) prepares devices while it is already
++  starting bootmgfw.efi from the Windows volume. An Erista build boots through the
++  normal BDS boot options instead, so the same preparation has to happen from
++  PlatformBootManagerAfterConsole: find WifiPrepare.efi, run it, and only if it
++  returned success patch the DSDT byte that makes the WFI0 device visible.
++
++  The ACPI device is defined once, in AcpiTables/Dsdt/Dsdt.asl under
++  SWITCH_WIFI_RUNTIME:
++
++      Name (WSTA, 0x10) // BytePrefix marker patched to 0x0F by Home BDS.
++
++  so the patch is a byte search for the NameOp + NameSeg "WSTA" + BytePrefix 0x0A
++  + 0x10 sequence, and the byte after 0x0A is set to 0x0F. The DSDT checksum is
++  repaired afterwards because Windows validates it on load. Until the byte is
++  patched, _STA returns 0 and an unpowered PCIe host is never handed to a driver.
++
++  Copyright (c) 2026, NintendoSwitchPkg contributors. SPDX-License-Identifier: BSD-2-Clause-Patent
++**/
++#include "PlatformBm.h"
++
++#ifdef SWITCH_WIFI_RUNTIME
++#include <Guid/Acpi.h>
++#include <IndustryStandard/Acpi.h>
++#include <Library/BaseMemoryLib.h>
++#include <Library/DevicePathLib.h>
++#include <Library/MemoryAllocationLib.h>
++#include <Library/UefiBootServicesTableLib.h>
++#include <Library/UefiLib.h>
++#include <Protocol/SimpleFileSystem.h>
++
++/**
++  Load and start a preparation application, then mark its ACPI device present.
++
++  @param[in]  Volume    Handle of the volume that holds FileName.
++  @param[in]  FileName  Path of the application, from the volume root.
++  @param[in]  Name      Four-character ACPI name whose marker is patched.
++
++  @retval EFI_SUCCESS  The application ran and the marker was patched.
++  @retval others       The device stays hidden; the caller may continue booting.
++**/
++EFI_STATUS
++EFIAPI
++PrepareWindowsDevice (
++  IN EFI_HANDLE  Volume,
++  IN CHAR16      *FileName,
++  IN CONST CHAR8 Name[4]
++  )
++{
++  EFI_ACPI_2_0_ROOT_SYSTEM_DESCRIPTION_POINTER *Rsdp;
++  EFI_ACPI_DESCRIPTION_HEADER                   *Xsdt;
++  EFI_ACPI_DESCRIPTION_HEADER                   *Table;
++  EFI_ACPI_DESCRIPTION_HEADER                   *Dsdt;
++  EFI_ACPI_2_0_FIXED_ACPI_DESCRIPTION_TABLE     *Fadt;
++  UINT8                                          Pattern[] = { 0x08, 0, 0, 0, 0, 0x0A, 0x10 };
++  UINT8                                         *Ready;
++  UINT8                                         *Aml;
++  UINT8                                          Sum;
++  UINTN                                          Entries;
++  UINTN                                          Index;
++  UINTN                                          Matches;
++  EFI_DEVICE_PATH_PROTOCOL                      *Path;
++  EFI_HANDLE                                     Image;
++  EFI_STATUS                                     Status;
++
++  Dsdt    = NULL;
++  Ready   = NULL;
++  Matches = 0;
++
++  CopyMem (Pattern + 1, Name, 4);
++  Status = EfiGetSystemConfigurationTable (&gEfiAcpi20TableGuid, (VOID **)&Rsdp);
++  if (EFI_ERROR (Status) || (Rsdp == NULL) || (Rsdp->XsdtAddress == 0)) {
++    return EFI_NOT_FOUND;
++  }
++
++  Xsdt = (EFI_ACPI_DESCRIPTION_HEADER *)(UINTN)Rsdp->XsdtAddress;
++  if (Xsdt->Length < sizeof (*Xsdt)) {
++    return EFI_COMPROMISED_DATA;
++  }
++
++  Entries = (Xsdt->Length - sizeof (*Xsdt)) / sizeof (UINT64);
++  for (Index = 0; (Index < Entries) && (Dsdt == NULL); ++Index) {
++    Table = (EFI_ACPI_DESCRIPTION_HEADER *)(UINTN)ReadUnaligned64 (
++                                                 (UINT64 *)((UINT8 *)Xsdt + sizeof (*Xsdt) + Index * 8));
++    if (Table->Signature != EFI_ACPI_2_0_FIXED_ACPI_DESCRIPTION_TABLE_SIGNATURE) {
++      continue;
++    }
++
++    if (Table->Length < sizeof (*Fadt)) {
++      return EFI_COMPROMISED_DATA;
++    }
++
++    Fadt = (EFI_ACPI_2_0_FIXED_ACPI_DESCRIPTION_TABLE *)Table;
++    Dsdt = (EFI_ACPI_DESCRIPTION_HEADER *)(UINTN)(Fadt->XDsdt ? Fadt->XDsdt : Fadt->Dsdt);
++  }
++
++  if ((Dsdt == NULL) || (Dsdt->Length < sizeof (*Dsdt))) {
++    return EFI_NOT_FOUND;
++  }
++
++  Aml = (UINT8 *)Dsdt;
++  for (Index = sizeof (*Dsdt); Index + sizeof (Pattern) <= Dsdt->Length; ++Index) {
++    if (CompareMem (Aml + Index, Pattern, sizeof (Pattern)) == 0) {
++      Ready = Aml + Index + 6;
++      Matches++;
++    }
++  }
++
++  // Exactly one marker, or the patched byte could belong to another device.
++  if (Matches != 1) {
++    return EFI_NOT_FOUND;
++  }
++
++  Path = FileDevicePath (Volume, FileName);
++  if (Path == NULL) {
++    return EFI_OUT_OF_RESOURCES;
++  }
++
++  Status = gBS->LoadImage (FALSE, gImageHandle, Path, NULL, 0, &Image);
++  FreePool (Path);
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Status = gBS->StartImage (Image, NULL, NULL);
++  gBS->UnloadImage (Image);
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  *Ready       = 0x0F;
++  Dsdt->Checksum = 0;
++  for (Index = 0, Sum = 0; Index < Dsdt->Length; ++Index) {
++    Sum = (UINT8)(Sum + Aml[Index]);
++  }
++
++  Dsdt->Checksum = (UINT8)(0 - Sum);
++  MemoryFence ();
++  return EFI_SUCCESS;
++}
++
++/**
++  Look for FileName on every simple file system volume and prepare it once.
++
++  @param[in]  FileName  Path of the application, from a volume root.
++  @param[in]  Name      Four-character ACPI name whose marker is patched.
++
++  @retval EFI_SUCCESS  The application was found, ran and patched its device.
++  @retval EFI_NOT_FOUND  No volume holds FileName.
++  @retval others       The preparation itself failed.
++**/
++EFI_STATUS
++EFIAPI
++PrepareWindowsDeviceFromVolumes (
++  IN CHAR16       *FileName,
++  IN CONST CHAR8  Name[4]
++  )
++{
++  EFI_HANDLE                       *Volumes;
++  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL  *Fs;
++  EFI_FILE_PROTOCOL                *Root;
++  EFI_FILE_PROTOCOL                *File;
++  EFI_STATUS                        Status;
++  UINTN                             Count;
++  UINTN                             Index;
++
++  Status = gBS->LocateHandleBuffer (ByProtocol, &gEfiSimpleFileSystemProtocolGuid, NULL, &Count, &Volumes);
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Status = EFI_NOT_FOUND;
++  for (Index = 0; Index < Count; ++Index) {
++    if (EFI_ERROR (gBS->HandleProtocol (Volumes[Index], &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Fs))) {
++      continue;
++    }
++
++    if (EFI_ERROR (Fs->OpenVolume (Fs, &Root))) {
++      continue;
++    }
++
++    // Only volumes that actually carry the application are prepared; on a
++    // Switch SD card that is the FAT32 ESP, which UEFI reads without any helper.
++    if (!EFI_ERROR (Root->Open (Root, &File, FileName, EFI_FILE_MODE_READ, 0))) {
++      File->Close (File);
++      Root->Close (Root);
++      Status = PrepareWindowsDevice (Volumes[Index], FileName, Name);
++      if (!EFI_ERROR (Status)) {
++        break;
++      }
++
++      continue;
++    }
++
++    Root->Close (Root);
++  }
++
++  gBS->FreePool (Volumes);
++  return Status;
++}
++#endif
+diff --git a/NintendoSwitch.dsc b/NintendoSwitch.dsc
+index c6edd32..38f21f7 100644
+--- a/NintendoSwitch.dsc
++++ b/NintendoSwitch.dsc
+@@ -54,6 +54,13 @@
+   !ifndef SWITCH_LITE_TOUCH
+     !error "SWITCH_LITE_SIO requires the HDH-001 GPIO profile"
+   !endif
++!endif
++  DEFINE WIFI_ERISTA_FLAGS      =
++!ifdef SWITCH_WIFI_ERISTA
++  DEFINE WIFI_ERISTA_FLAGS      = -DSWITCH_WIFI_ERISTA=1
++  !ifndef SWITCH_HEKATE
++    !error "SWITCH_WIFI_ERISTA requires the Hekate boot chain"
++  !endif
+ !endif
+   DEFINE WIFI_RUNTIME_FLAGS   =
+ !ifdef SWITCH_WIFI_RUNTIME
+@@ -62,10 +69,14 @@
+     !error "SWITCH_WIFI_RUNTIME requires the Hekate Home boot chain"
+   !endif
+   !ifndef SWITCH_LITE_BOOT_SD
+-    !error "SWITCH_WIFI_RUNTIME requires the bounded Home boot profile"
++    !ifndef SWITCH_WIFI_ERISTA
++      !error "SWITCH_WIFI_RUNTIME requires SWITCH_LITE_BOOT_SD (Lite) or SWITCH_WIFI_ERISTA (Erista)"
++    !endif
+   !endif
+   !ifndef SWITCH_LITE_POWER
+-    !error "SWITCH_WIFI_RUNTIME requires the I2C5 power profile"
++    !ifndef SWITCH_WIFI_ERISTA
++      !error "SWITCH_WIFI_RUNTIME requires the I2C5 power profile (Lite) or SWITCH_WIFI_ERISTA (Erista: PmicDxe owns I2C5)"
++    !endif
+   !endif
+ !endif
+ !ifdef SWITCH_LITE_BOOT_SD
+@@ -171,7 +182,7 @@
+ [BuildOptions.common]
+ !ifdef SWITCH_HEKATE
+   # Boot chain: hekate (L4T launcher) -> BL31 -> bl33.bin (stub + this FD).
+-  GCC:*_*_AARCH64_CC_FLAGS = -std=gnu11 -Wno-unused-variable -DSWITCH_BOOT_CHAIN_HEKATE=1 $(EXCFB_FLAGS) $(LITE_TOUCH_FLAGS) $(LITE_FAN_FLAGS) $(LITE_PERFORMANCE_FLAGS) $(WIFI_RUNTIME_FLAGS) $(LITE_XUSB_FLAGS) $(LITE_BOOT_SD_FLAGS)
++  GCC:*_*_AARCH64_CC_FLAGS = -std=gnu11 -Wno-unused-variable -DSWITCH_BOOT_CHAIN_HEKATE=1 $(EXCFB_FLAGS) $(LITE_TOUCH_FLAGS) $(LITE_FAN_FLAGS) $(LITE_PERFORMANCE_FLAGS) $(WIFI_RUNTIME_FLAGS) $(WIFI_ERISTA_FLAGS) $(LITE_XUSB_FLAGS) $(LITE_BOOT_SD_FLAGS)
+ !else
+   GCC:*_*_AARCH64_CC_FLAGS = -Wno-unused-variable $(EXCFB_FLAGS)
+ !endif
+@@ -222,7 +233,7 @@
+ !else
+   DEFINE ACPI_ASL_SWOA           =
+ !endif
+-  GCC:*_*_AARCH64_ASLPP_FLAGS = $(LITE_XUSB_FLAGS) $(LITE_SIO_FLAGS) $(WIFI_RUNTIME_FLAGS) $(LITE_BOOT_SD_FLAGS) $(LITE_BACKLIGHT_FLAGS) $(LITE_BLUETOOTH_FLAGS) $(LITE_AUDIO_FLAGS) $(LITE_DISPLAY_FLAGS) $(LITE_SYSTEM_FLAGS) $(LITE_PERFORMANCE_FLAGS) $(LITE_FAN_FLAGS) $(LITE_POWER_FLAGS) $(LITE_TOUCH_FLAGS) $(ACPI_ASL_SDNV) $(ACPI_ASL_SWOA) $(ACPI_ASL_EMMC) $(ACPI_ASL_XHCI) $(ACPI_ASL_EHCI) $(ACPI_ASL_EHCI_TXFILL)
++  GCC:*_*_AARCH64_ASLPP_FLAGS = $(LITE_XUSB_FLAGS) $(LITE_SIO_FLAGS) $(WIFI_RUNTIME_FLAGS) $(WIFI_ERISTA_FLAGS) $(LITE_BOOT_SD_FLAGS) $(LITE_BACKLIGHT_FLAGS) $(LITE_BLUETOOTH_FLAGS) $(LITE_AUDIO_FLAGS) $(LITE_DISPLAY_FLAGS) $(LITE_SYSTEM_FLAGS) $(LITE_PERFORMANCE_FLAGS) $(LITE_FAN_FLAGS) $(LITE_POWER_FLAGS) $(LITE_TOUCH_FLAGS) $(ACPI_ASL_SDNV) $(ACPI_ASL_SWOA) $(ACPI_ASL_EMMC) $(ACPI_ASL_XHCI) $(ACPI_ASL_EHCI) $(ACPI_ASL_EHCI_TXFILL)
+ 
+ ################################################################################
+ #
+-- 
+2.55.0.windows.5
+

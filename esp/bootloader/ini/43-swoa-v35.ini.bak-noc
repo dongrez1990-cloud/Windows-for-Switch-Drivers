@@ -1,0 +1,4 @@
+[SWOA v35 bring-up wait + WiFi prep + BDS bootmgfw]
+l4t=1
+boot_prefixes=switchroot/winx-v35/
+id=WINXV35
