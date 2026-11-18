@@ -1,13 +1,10 @@
 # Windows ARM64 drivers for Nintendo Switch Lite
 
-Drivers for the **HDH-001 (Tegra T214)** port of Windows 11 ARM64. They use the ACPI devices exposed by the [WinX companion firmware](https://github.com/ruje0504-2/winx). The tested system runs Windows 11 23H2 (22631.2861).
+This repository contains the Windows 11 ARM64 board drivers for **Nintendo Switch Lite (HDH-001, Tegra T214)**. They use the ACPI devices exposed by WinX. The `switchfan` driver also supplies the clocks used by the companion Mesa NVDEC driver. The tested system runs Windows 11 23H2 (22631.2861). [WinX firmware](https://github.com/ruje0504-2/winx) · [Mesa graphics and video](https://github.com/ruje0504-2/mesa-switch-woa)
 
 ## Drivers on hardware
 
-Power/tool rows were updated on2026-11-15; other package rows retain their
-2026-11-12/13 inventories.
-Installation alone does not establish feature acceptance; older default-branch
-source and earlier validation baselines are identified explicitly.
+The board-package inventory dates to November 12–13, 2026. The power tests ran on November 15. Later display, Vulkan and video results below identify the Mesa build and workload used for each check.
 
 | Driver | Result on Switch Lite |
 | --- | --- |
@@ -19,17 +16,14 @@ source and earlier validation baselines are identified explicitly.
 | `switchsio` 0.2.5.0 desktop controls | Current installed version verified. Left-stick pointer, ZR/ZL clicks, Capture desktop mode and **+** On-Screen Keyboard are the existing mapping; right-stick scrolling, R3 middle click and D-pad arrows were added in 0.2.3. This inventory does not newly validate those features on 0.2.5.0. [Button mapping](drivers/SwitchSensor/README.md) |
 | `switchaudio` 1.0.0.9 | The built-in speakers play audio. Headphones and jack switching await testing. |
 | `switchrtc` 1.0.0.3 | Installed package reverified after the SD update. Earlier RTC/time restoration passed; this version inventory is not a new long-term clock-retention test. |
-| `switchfan` **1.0.0.33** | Noble ACTMON watermark IRQs and CPU/display EMC floors;204/1331.2/1600/2500MHz trained points. Native errors0, real IRQ and completed transitions verified; owner manual testing passed. Seven power/three independent fan choices saved. [Current evidence](docs/hdh001/dvfs-tray.md) |
+| `switchfan` and NVDEC clocks | The 1.0.0.33 power tests verified ACTMON interrupts and memory-clock transitions with CPU/display bandwidth floors. The trained rates were 204, 1331.2, 1600 and 2500 MHz. The 1080p NVDEC run used the later `switchfan.sys` clock provider (SHA-256 prefix `0453418e`) and recorded Handheld mode, CPU DFLL active, fan mode 1, zero EMC error and an 85% charge target. [Power tests](docs/hdh001/dvfs-tray.md) · [Provider and component identities](https://github.com/ruje0504-2/mesa-switch-woa/blob/1cf6db16e13c34de39658641b68cdf71cabc292d/tegra-x1-wddm/docs/NVDEC_INTEGRATION_20261116.json) · [Hardware readback](https://github.com/ruje0504-2/mesa-switch-woa/blob/1cf6db16e13c34de39658641b68cdf71cabc292d/tegra-x1-wddm/docs/NVDEC_1080_D3D11VA_20261117.json) |
+| Companion display and Vulkan drivers | Fixed 90° row-scan landscape passed on the panel. On the earlier fixed-landscape build, native Win32 `vkcube` ran on GM20B for 300.289 seconds and exited normally. Four-direction switching remains open. [Display baseline](https://github.com/ruje0504-2/mesa-switch-woa/blob/1cf6db16e13c34de39658641b68cdf71cabc292d/tegra-x1-wddm/docs/ROW_SCAN_BASELINE_20261116.md) · [Vulkan run](https://github.com/ruje0504-2/mesa-switch-woa/blob/1cf6db16e13c34de39658641b68cdf71cabc292d/tegra-x1-wddm/docs/VKCUBE_ACCEPTANCE_20261116.md) |
+| Companion video and game support | D3D11VA/NVDEC passed paced six-frame H.264 window tests at 720p and 1080p. Sustained playback remains open. ARM64 DXVK v3.1.1 game rendering, input and normal exit on native NVK are under evaluation. [720p run](https://github.com/ruje0504-2/mesa-switch-woa/blob/1cf6db16e13c34de39658641b68cdf71cabc292d/tegra-x1-wddm/docs/NVDEC_720_COMPOSITOR_OPEN_20261117.json) · [1080p run](https://github.com/ruje0504-2/mesa-switch-woa/blob/1cf6db16e13c34de39658641b68cdf71cabc292d/tegra-x1-wddm/docs/NVDEC_1080_D3D11VA_20261117.json) |
 | `switchpwrbtn` **1.0.0.7** | Current polling implementation with validated VDD_CORE vote handling. Earlier owner-confirmed S0 screen-off/wake applies to1.0.0.4; no new SC7/S4 acceptance. [Source](drivers/SwitchPowerButton) |
 | `switchbattery` **1.0.0.14** / shutdown | Includes the battery request-ownership correction introduced in 1.0.0.8, on which normal shutdown powered off the tested Lite with Wi-Fi, Bluetooth, audio and gamepad enabled. Native restart subsequently passed on the normal R6 firmware without fan pulses. [Power status](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/power-performance.md) |
 | `switchbattery` **1.0.0.14** / charging and telemetry | Retains charge termination/safety timer; persistent85%limit uses80–90%hysteresis. Cached, calibrated MAX17050 signed current and battery net power verified; this is not AC total power. [Current evidence](docs/hdh001/dvfs-tray.md) |
 
-Switch Power and Pacecar auto-start in the desktop session, with saved independent
-power/fan choices, battery net watts and50%background transparency. The original
-Switchroot Joy-Con icon is embedded in Switch Power. The desktop
-`打开硬件工具.cmd` reopens both; no tool shortcuts are required.
-
-The experimental Tegra GPU driver and Mesa NVK ICD are maintained together. Native Vulkan triangle readback and Display-class Code 0 were verified on the Lite. DWM acceleration is in development. [GPU project](https://github.com/ruje0504-2/mesa-switch-woa)
+Switch Power and Pacecar start in the desktop session. Power and fan selections are saved independently. Pacecar shows net battery power and uses a 50% transparent background. Switch Power uses the original Switchroot Joy-Con icon. The desktop command `打开硬件工具.cmd` reopens both tools. [Desktop tools and power tests](docs/hdh001/dvfs-tray.md)
 
 The USB-C host package is on the Windows 23H2 card and awaits hardware testing. [USB-C host](drivers/TegraXusb/README.md)
 
