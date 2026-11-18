@@ -1,0 +1,25 @@
+﻿# Installed driver manifest, 2026-11-18 (Erista / ARM64)
+# Values below were verified live over SSH during this session (pnputil /enum-drivers
+# + Get-PnpDeviceProperty). If a newer live capture exists it supersedes this file.
+
+WLAN device   : ACPI\SWOA0D01\0   "Switch Lite BCM4356 Wireless Adapter"
+WLAN status   : OK   problemCode = (none)
+WLAN driver   : 0.7.4.0  via oem52.inf     (0.7.3.0 was oem51.inf, 0.7.0.0 was oem13.inf)
+WLAN link     : Up, 866.7 Mbps, 5 GHz ch36, 802.11ac, CMCC-ZouLX-5G
+
+Driver            Version     Provider    InfName
+----------------  ----------  ----------  --------
+switchwifi        0.7.4.0     WinX        oem52.inf
+switchbt          1.0.0.19    SwitchWOA   oem15.inf
+switchfan         1.0.0.22    SwitchWOA   oem17.inf   (1.0.0.8 was oem16.inf)
+switchjoycon      0.1.1.0     SwitchWOA   oem19.inf   (0.1.0.0 was oem18.inf)
+switchsio         0.2.3.0     SwitchWOA   oem11.inf
+switchsensor      1.0.0.1     SwitchWOA   oem10.inf
+switchaudio       1.0.0.17    SwitchWOA   oem12.inf
+Tegra210Sdhc      0.4.0.1     SwitchWOA   (build\Tegra210Sdhc)
+
+Services: switchwifi Running/Manual, switchbt, switchtouch, switchfan,
+          switchaudio, switchjoycon all Running.
+
+Health at end of session: device OK (never poisoned), 5/5 disconnect-reconnect
+cycles ~2 s each and a 10/10 cycle soak, kfail=0, erp=59 kadd=34.

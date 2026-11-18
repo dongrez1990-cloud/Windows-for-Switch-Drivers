@@ -1,0 +1,188 @@
+﻿##### wifi-install-073.log
+[13:30:01] === install 0.7.3.0 start ===
+[13:30:03] before: driver=0.7.0.0 status=OK
+[13:30:06] pnputil exit=0
+[13:30:06] pnputil output: Microsoft PnP ���� |  | ����������������:  switchwifi.inf | �ѳɹ������������������ | ��������:         oem51.inf | ����������Ѱ�װ���豸��: ACPI\SWOA0D01\0 |  | �������������:  1 | ����������������:  1
+[13:30:11] after : driver=0.7.3.0 status=OK
+[13:30:19] link up after ~3s: status=Up speed=585 Mbps
+[13:30:19] === install 0.7.3.0 done ===
+##### wifi-install-074.log
+[13:46:01] === install 0.7.4.0 start ===
+[13:46:03] before: driver=0.7.3.0 status=OK
+[13:46:08] pnputil exit=0
+[13:46:08] pnputil output: Microsoft PnP ���� |  | ����������������:  switchwifi.inf | �ѳɹ������������������ | ��������:         oem52.inf | ����������Ѱ�װ���豸��: ACPI\SWOA0D01\0 |  | �������������:  1 | ����������������:  1
+[13:46:13] after : driver=0.7.4.0 status=OK
+[13:46:21] link up after ~3s: speed=866.7 Mbps
+[13:46:21] === install 0.7.4.0 done ===
+##### wifi-install.log
+=== install-wifi 2022/05/07 ���� 20:20:09.66 
+dir C:\SwitchWOA\drivers\switchwifi072 
+switchwifi.cat
+switchwifi.inf
+switchwifi.sys
+�Ѹ���         1 ���ļ���
+�Ѹ���         1 ���ļ���
+Root "�����εĸ�֤��䷢����"
+ǩ���빫Կƥ��
+���֤��:
+
+��ȷƥ��:
+Ԫ�� 13:
+���к�: 6a20b112950077a24b0138e7efd8ca5b
+�䷢��: CN=SwitchWOA Test Driver Signing 2020
+ NotBefore: 2020/1/1 0:00
+ NotAfter: 2045/1/1 0:00
+ʹ����: CN=SwitchWOA Test Driver Signing 2020
+ǩ���빫Կƥ��
+��֤��: ʹ������䷢��ƥ��
+֤���ϣ(sha1): 05c4b7da0d3b425dc42a419bdf65a6cb8e343a9f
+
+֤�� "SwitchWOA Test Driver Signing 2020" �Ѿ��ڴ洢�С�
+CertUtil: -addstore ����ɹ���ɡ�
+TrustedPublisher "�����εķ�����"
+ǩ���빫Կƥ��
+���֤��:
+
+��ȷƥ��:
+Ԫ�� 2:
+���к�: 6a20b112950077a24b0138e7efd8ca5b
+�䷢��: CN=SwitchWOA Test Driver Signing 2020
+ NotBefore: 2020/1/1 0:00
+ NotAfter: 2045/1/1 0:00
+ʹ����: CN=SwitchWOA Test Driver Signing 2020
+ǩ���빫Կƥ��
+��֤��: ʹ������䷢��ƥ��
+֤���ϣ(sha1): 05c4b7da0d3b425dc42a419bdf65a6cb8e343a9f
+
+֤�� "SwitchWOA Test Driver Signing 2020" �Ѿ��ڴ洢�С�
+CertUtil: -addstore ����ɹ���ɡ�
+Microsoft PnP ����
+
+����������������:  switchwifi.inf
+�ѳɹ������������������
+��������:         oem13.inf
+����������Ѱ�װ���豸��: ACPI\SWOA0D01\0
+
+�������������:  1
+����������������:  1
+pnputil exit=0 
+Microsoft PnP ����
+
+����ɨ���豸Ӳ�����ġ�
+ɨ����ɡ�
+
+done 
+##### wifi-lrtest.log
+[13:35:01.807] === 0.7.3.0 leave-policy test: 5 disconnect/reconnect cycles, profile 'CMCC-ZouLX-5G' ===
+[13:35:03.151] driver=0.7.3.0
+[13:35:07.546] baseline: device=OK/ adapter=Up speed=702 Mbps ssid='CMCC-ZouLX-5G' | leave=0/00000000 dn=0/0 join=1/00000000 scan=3/C00000B5 step=5/00000000 kadd=2 ev=7/0/10001
+[13:35:07.561] --- cycle 1 ---
+[13:35:08.093] pre-disconnect : device=OK/ adapter=Up speed=702 Mbps ssid='CMCC-ZouLX-5G' | leave=0/00000000 dn=0/0 join=1/00000000 scan=3/C00000B5 step=5/00000000 kadd=2 ev=7/0/10001
+[13:35:10.180]   +1s after disconnect: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=1/D3 join=1/00000000 scan=3/C00000B5 step=5/00000000 kadd=2 ev=10/0/10801
+[13:35:11.714]   +2s after disconnect: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=1/D3 join=1/00000000 scan=3/C00000B5 step=5/00000000 kadd=2 ev=10/0/10801
+[13:35:13.342]   +3s after disconnect: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=1/D3 join=1/00000000 scan=4/00000000 step=5/00000000 kadd=2 ev=10/0/10801
+[13:35:45.485]   !! NOT reconnected after 30s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=7/D3 join=4/00000000 scan=6/00000000 step=5/00000000 kadd=2 ev=30/0/10801
+[13:35:45.501]   !! this is the regression the 0.5.7 port is supposed to prevent
+[13:35:45.501] --- cycle 2 ---
+[13:35:46.048] pre-disconnect : device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=7/D3 join=4/00000000 scan=6/00000000 step=5/00000000 kadd=2 ev=30/0/10801
+[13:35:47.751]   +1s after disconnect: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=7/D3 join=4/00000000 scan=6/00000000 step=5/00000000 kadd=2 ev=30/0/10801
+[13:35:49.270]   +2s after disconnect: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=7/D3 join=4/00000000 scan=6/00000000 step=5/00000000 kadd=2 ev=30/0/10801
+[13:35:50.786]   +3s after disconnect: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=7/D3 join=4/00000000 scan=6/00000000 step=5/00000000 kadd=2 ev=30/0/10801
+[13:36:23.002]   !! NOT reconnected after 30s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=13/D3 join=7/00000000 scan=8/00000000 step=5/00000000 kadd=2 ev=50/0/10801
+[13:36:23.002]   !! this is the regression the 0.5.7 port is supposed to prevent
+[13:36:23.002] --- cycle 3 ---
+[13:36:23.533] pre-disconnect : device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=13/D3 join=7/00000000 scan=8/00000000 step=5/00000000 kadd=2 ev=50/0/10801
+[13:36:25.222]   +1s after disconnect: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=13/D3 join=7/00000000 scan=8/00000000 step=5/00000000 kadd=2 ev=50/0/10801
+[13:36:26.769]   +2s after disconnect: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=13/D3 join=7/00000000 scan=8/00000000 step=5/00000000 kadd=2 ev=50/0/10801
+[13:36:28.304]   +3s after disconnect: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=13/D3 join=7/00000000 scan=8/00000000 step=5/00000000 kadd=2 ev=50/0/10801
+[13:37:00.388]   !! NOT reconnected after 30s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=19/D3 join=10/00000000 scan=10/00000000 step=5/00000000 kadd=2 ev=70/0/10801
+[13:37:00.388]   !! this is the regression the 0.5.7 port is supposed to prevent
+[13:37:00.388] --- cycle 4 ---
+[13:37:00.935] pre-disconnect : device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=19/D3 join=10/00000000 scan=10/00000000 step=5/00000000 kadd=2 ev=70/0/10801
+[13:37:02.623]   +1s after disconnect: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=19/D3 join=10/00000000 scan=10/00000000 step=5/00000000 kadd=2 ev=70/0/10801
+[13:37:04.139]   +2s after disconnect: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=19/D3 join=10/00000000 scan=10/00000000 step=5/00000000 kadd=2 ev=70/0/10801
+[13:37:05.671]   +3s after disconnect: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=19/D3 join=10/00000000 scan=10/00000000 step=5/00000000 kadd=2 ev=70/0/10801
+[13:37:37.806]   !! NOT reconnected after 30s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=25/D3 join=13/00000000 scan=12/00000000 step=5/00000000 kadd=2 ev=90/0/10801
+[13:37:37.806]   !! this is the regression the 0.5.7 port is supposed to prevent
+[13:37:37.823] --- cycle 5 ---
+[13:37:38.354] pre-disconnect : device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=25/D3 join=13/00000000 scan=12/00000000 step=5/00000000 kadd=2 ev=90/0/10801
+[13:37:40.042]   +1s after disconnect: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=25/D3 join=13/00000000 scan=12/00000000 step=5/00000000 kadd=2 ev=90/0/10801
+[13:37:41.574]   +2s after disconnect: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=25/D3 join=13/00000000 scan=12/00000000 step=5/00000000 kadd=2 ev=90/0/10801
+[13:37:43.094]   +3s after disconnect: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=25/D3 join=13/00000000 scan=12/00000000 step=5/00000000 kadd=2 ev=90/0/10801
+[13:38:15.218]   !! NOT reconnected after 30s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=31/D3 join=16/00000000 scan=14/00000000 step=5/00000000 kadd=2 ev=110/0/10801
+[13:38:15.233]   !! this is the regression the 0.5.7 port is supposed to prevent
+[13:38:15.233] === summary ===
+[13:38:15.764] final: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=31/D3 join=16/00000000 scan=14/00000000 step=5/00000000 kadd=2 ev=110/0/10801
+[13:38:16.014] VERDICT: device OK/code after 5 cycles -> PASS (never poisoned)
+[13:38:16.014] === end ===
+##### wifi-lrtest2.log
+[13:49:01.879] === 0.7.4.0 reconnect test: 5 cycles, profile 'CMCC-ZouLX-5G' ===
+[13:49:03.319] driver=0.7.4.0
+[13:49:07.696] baseline: device=OK/ adapter=Up speed=866.7 Mbps ssid='CMCC-ZouLX-5G' | leave=0/00000000 dn=0/0 join=1/00000000 scan=2/00000000 erx=3 kadd=2 kfail=0 ev=6/0/10001
+[13:49:07.711] --- cycle 1 ---
+[13:49:08.931] pre-disconnect : device=OK/ adapter=Up speed=866.7 Mbps ssid='CMCC-ZouLX-5G' | leave=0/00000000 dn=0/0 join=1/00000000 scan=2/00000000 erx=3 kadd=2 kfail=0 ev=6/0/10001
+[13:49:09.576]   netsh disconnect: �ѳɹ���ɽӿڡ�WLAN���ĶϿ���������
+[13:49:11.333]   +1s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=1/D3 join=1/00000000 scan=2/00000000 erx=3 kadd=2 kfail=0 ev=9/0/10801
+[13:49:12.973]   +2s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=1/D3 join=1/00000000 scan=2/00000000 erx=3 kadd=2 kfail=0 ev=9/0/10801
+[13:49:14.494]   +3s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=1/D3 join=1/00000000 scan=3/00000000 erx=3 kadd=2 kfail=0 ev=9/0/10801
+[13:49:14.760]   netsh connect: �ѳɹ������������
+[13:49:17.494]   reconnected after ~2s: device=OK/ adapter=Up speed=702 Mbps ssid='CMCC-ZouLX-5G' | leave=0/00000000 dn=2/E0 join=2/00000000 scan=3/00000000 erx=5 kadd=4 kfail=0 ev=13/0/10801
+[13:49:17.505] --- cycle 2 ---
+[13:49:18.177] pre-disconnect : device=OK/ adapter=Up speed=702 Mbps ssid='CMCC-ZouLX-5G' | leave=0/00000000 dn=2/E0 join=2/00000000 scan=3/00000000 erx=5 kadd=4 kfail=0 ev=13/0/10801
+[13:49:18.601]   netsh disconnect: �ѳɹ���ɽӿڡ�WLAN���ĶϿ���������
+[13:49:20.203]   +1s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=3/D3 join=2/00000000 scan=3/00000000 erx=5 kadd=4 kfail=0 ev=16/0/10801
+[13:49:21.737]   +2s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=3/D3 join=2/00000000 scan=3/00000000 erx=5 kadd=4 kfail=0 ev=16/0/10801
+[13:49:23.256]   +3s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=3/D3 join=2/00000000 scan=4/00000000 erx=5 kadd=4 kfail=0 ev=16/0/10801
+[13:49:23.491]   netsh connect: �ѳɹ������������
+[13:49:26.443]   reconnected after ~2s: device=OK/ adapter=Up speed=866.5 Mbps ssid='CMCC-ZouLX-5G' | leave=0/00000000 dn=4/E0 join=3/00000000 scan=4/00000000 erx=8 kadd=6 kfail=0 ev=20/0/10801
+[13:49:26.443] --- cycle 3 ---
+[13:49:27.008] pre-disconnect : device=OK/ adapter=Up speed=866.5 Mbps ssid='CMCC-ZouLX-5G' | leave=0/00000000 dn=4/E0 join=3/00000000 scan=4/00000000 erx=8 kadd=6 kfail=0 ev=20/0/10801
+[13:49:27.409]   netsh disconnect: �ѳɹ���ɽӿڡ�WLAN���ĶϿ���������
+[13:49:28.975]   +1s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=5/D3 join=3/00000000 scan=4/00000000 erx=8 kadd=6 kfail=0 ev=23/0/10801
+[13:49:30.526]   +2s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=5/D3 join=3/00000000 scan=4/00000000 erx=8 kadd=6 kfail=0 ev=23/0/10801
+[13:49:32.060]   +3s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=5/D3 join=3/00000000 scan=5/00000000 erx=8 kadd=6 kfail=0 ev=23/0/10801
+[13:49:32.428]   netsh connect: �ѳɹ������������
+[13:49:35.354]   reconnected after ~2s: device=OK/ adapter=Up speed=866.5 Mbps ssid='CMCC-ZouLX-5G' | leave=0/00000000 dn=6/E0 join=4/00000000 scan=5/00000000 erx=11 kadd=8 kfail=0 ev=27/0/10801
+[13:49:35.365] --- cycle 4 ---
+[13:49:35.919] pre-disconnect : device=OK/ adapter=Up speed=866.5 Mbps ssid='CMCC-ZouLX-5G' | leave=0/00000000 dn=6/E0 join=4/00000000 scan=5/00000000 erx=11 kadd=8 kfail=0 ev=27/0/10801
+[13:49:36.278]   netsh disconnect: �ѳɹ���ɽӿڡ�WLAN���ĶϿ���������
+[13:49:37.890]   +1s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=7/D3 join=4/00000000 scan=5/00000000 erx=11 kadd=8 kfail=0 ev=30/0/10801
+[13:49:39.456]   +2s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=7/D3 join=4/00000000 scan=5/00000000 erx=11 kadd=8 kfail=0 ev=30/0/10801
+[13:49:41.050]   +3s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=7/D3 join=4/00000000 scan=6/00000000 erx=11 kadd=8 kfail=0 ev=30/0/10801
+[13:49:41.315]   netsh connect: �ѳɹ������������
+[13:49:44.286]   reconnected after ~2s: device=OK/ adapter=Up speed=866.5 Mbps ssid='CMCC-ZouLX-5G' | leave=0/00000000 dn=8/E0 join=5/00000000 scan=6/00000000 erx=14 kadd=10 kfail=0 ev=34/0/10801
+[13:50:09.563] --- cycle 5 ---
+[13:50:10.252] pre-disconnect : device=OK/ adapter=Up speed=866.7 Mbps ssid='CMCC-ZouLX-5G' | leave=0/00000000 dn=8/E0 join=5/00000000 scan=6/00000000 erx=14 kadd=10 kfail=0 ev=34/0/10801
+[13:50:19.469]   netsh disconnect: �ѳɹ���ɽӿڡ�WLAN���ĶϿ���������
+[13:50:21.214]   +1s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=9/D3 join=5/00000000 scan=6/00000000 erx=14 kadd=10 kfail=0 ev=37/0/10801
+[13:50:22.764]   +2s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=9/D3 join=5/00000000 scan=6/00000000 erx=14 kadd=10 kfail=0 ev=37/0/10801
+[13:50:34.650]   +3s: device=OK/ adapter=Disconnected speed=0 bps ssid='' | leave=0/00000000 dn=9/D3 join=5/00000000 scan=7/00000000 erx=14 kadd=10 kfail=0 ev=37/0/10801
+[13:50:35.636]   netsh connect: �ѳɹ������������
+[13:50:38.548]   reconnected after ~2s: device=OK/ adapter=Up speed=866.5 Mbps ssid='CMCC-ZouLX-5G' | leave=0/00000000 dn=10/E0 join=6/00000000 scan=7/00000000 erx=17 kadd=12 kfail=0 ev=41/0/10801
+[13:50:38.548] === summary ===
+[13:50:39.266] final: device=OK/ adapter=Up speed=866.5 Mbps ssid='CMCC-ZouLX-5G' | leave=0/00000000 dn=10/E0 join=6/00000000 scan=7/00000000 erx=17 kadd=12 kfail=0 ev=41/0/10801
+[13:50:39.516] VERDICT: device OK/code -> device healthy (never poisoned)
+[13:50:39.516] === end ===
+##### wifi-recover.log
+[13:40:00] recover start
+[13:40:05] before: status=Disconnected speed=0 bps
+[13:40:14] after : status=Disconnected speed=0 bps
+[13:40:14] recover stop
+##### wifi-rollback.log
+[13:39:01] marker wifi-073-ok present -> no rollback
+##### wifi-soak.log
+[13:54:01] === 0.7.4.0 soak: 10 cycles ===
+[13:54:03] start: driver=0.7.4.0 device=OK/ erx=30 kadd=14 kfail=0 dn=12/E0 join=10/00000000
+[13:55:01] cycle  1: OK   reconnected=True   58.1s speed=866.7 Mbps device=OK/ erx=33 kadd=16 kfail=0 dn=14/E0 join=11/00000000
+[13:55:07] cycle  2: OK   reconnected=True    5.2s speed=6 Mbps device=OK/ erx=35 kadd=18 kfail=0 dn=16/E0 join=12/00000000
+[13:55:14] cycle  3: OK   reconnected=True    7.2s speed=780 Mbps device=OK/ erx=38 kadd=20 kfail=0 dn=18/E0 join=13/00000000
+[13:56:12] cycle  4: OK   reconnected=True      9s speed=866.5 Mbps device=OK/ erx=41 kadd=22 kfail=0 dn=20/E0 join=14/00000000
+[13:56:20] cycle  5: OK   reconnected=True    7.4s speed=866.5 Mbps device=OK/ erx=44 kadd=24 kfail=0 dn=22/E0 join=15/00000000
+[13:56:32] cycle  6: OK   reconnected=True    7.3s speed=866.5 Mbps device=OK/ erx=47 kadd=26 kfail=0 dn=24/E0 join=16/00000000
+[13:56:39] cycle  7: OK   reconnected=True    6.6s speed=866.5 Mbps device=OK/ erx=50 kadd=28 kfail=0 dn=26/E0 join=17/00000000
+[13:56:47] cycle  8: OK   reconnected=True    7.2s speed=866.5 Mbps device=OK/ erx=53 kadd=30 kfail=0 dn=28/E0 join=18/00000000
+[13:56:56] cycle  9: OK   reconnected=True    7.2s speed=866.5 Mbps device=OK/ erx=56 kadd=32 kfail=0 dn=30/E0 join=19/00000000
+[13:57:04] cycle 10: OK   reconnected=True    7.3s speed=866.5 Mbps device=OK/ erx=59 kadd=34 kfail=0 dn=32/E0 join=20/00000000
+[13:57:04] === result: 10/10 cycles reconnected; device=OK/ ===
+[13:57:04] final: erx=59 kadd=34 kfail=0 dn=32/E0 join=20/00000000
+[13:57:04] === end ===

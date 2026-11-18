@@ -1,0 +1,1450 @@
+﻿/* * switchjoycon - Nintendo Switch (Erista) Joy-Con rail gamepad for Windows ARM64. * * Right Joy-Con: UART-B
+ * 0x70006040, GIC SPI 69 (GSI 101), detect PH6 (62). * Left  Joy-Con: UART-C 0x70006200, GIC SPI 70 (GSI 102), detect
+ * PE6 (38). * * ACPI: SWOA0E01 (right) / SWOA0E02 (left).  The wire protocol is the switchroot * joycon-serdev rail
+ * protocol; see ../ref/PROTOCOL.md. * * The UEFI firmware sets the pad mux, the 16 MHz UART clock and the Joy-Con *
+ * charge enable; this driver programs the 16550 registers, runs the handshake * and exposes a VHF HID gamepad. * *
+ * SPDX-License-Identifier: GPL-2.0-only */
+#include <ntddk.h>
+#include <ntstrsafe.h>
+#include <wdf.h>
+#include <acpiioct.h>
+#include <gpio.h>
+#include <vhf.h>
+#include "jc.h"
+enum {
+    JcRxCapacity = 2048,
+    JcPollMs = 2,
+    JcWaitMs = 120,
+    JcHandshakeRetries = 5,
+    JcReportRequestMs = 15,
+    JcDetachMs = 500,
+    JcReinitMs = 200,
+    JcDetectStableMs = 40,
+    JcRightUartBase = 0x70006040,
+    JcLeftUartBase = 0x70006200,
+    JcVersion = 302,    /* A 0x30 report arrives every ~15 ms, so a real stick cannot move this far
+ * between two
+                           reports; anything bigger is a mis-parsed frame. */
+    JcAxisJump = 12000, /* Report payload length is 13 + 12*n (n IMU samples). */
+    JcReportBase = 13,
+    JcReportStride = 12,
+    JcReportMax = 61, /* Stick centre self-calibration: 32 still frames, rejecting jumps and a
+ * spread that means
+                         the stick was being moved while we measured. */
+    JcCalCount = 32,
+    JcCalOutlier = 400, /* a sample this far from the mean is not the stick */
+    JcCalSpread = 300,  /* max-min inside the window */
+    JcCalRestartMax = 8,
+    JcCalSaneMin = 1000,
+    JcCalSaneMax = 3100
+};
+#define MS_TO_100NS(ms) ((ULONGLONG)(ms) * 10000)
+/* Report 1: gamepad, 14 buttons + hat + four 16-bit axes. */
+static UCHAR
+    JcReportDescriptor[] = {0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01, 0x05, 0x09, 0x19, 0x01, 0x29, 0x0E, 0x15,
+                            0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0E, 0x81, 0x02, 0x95, 0x02, 0x81, 0x03, 0x05, 0x01,
+                            0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42, 0x81, 0x03, 0x09,
+                            0x30, 0x09, 0x31, 0x09, 0x33, 0x09, 0x34, 0x16, 0x01, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10,
+                            0x95, 0x04, 0x81, 0x02, 0xC0, /* Mouse, report 2: left stick moves the pointer, ZL/ZR click,
+                                                             L/R right/middle. */
+                            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x02, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09, 0x19,
+                            0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x03, 0x81, 0x02, 0x75, 0x05,
+                            0x95, 0x01, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25,
+                            0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, 0x05, 0x0C, 0x0A, 0x38, 0x02, 0x95, 0x01, 0x81,
+                            0x06, 0xC0, 0xC0, /* Keyboard, report 3: d-pad as arrow keys. */
+                            0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x03, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15,
+                            0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x75, 0x08, 0x95, 0x01, 0x81, 0x03,
+                            0x19, 0x00, 0x29, 0x65, 0x15, 0x00, 0x25, 0x65, 0x75, 0x08, 0x95, 0x06, 0x81, 0x00, 0xC0};
+#pragma pack(push, 1)
+typedef struct {
+    UCHAR Id;
+    USHORT Buttons;
+    UCHAR Hat;
+    SHORT Axis[4];
+} JC_REPORT;
+#pragma pack(pop)
+C_ASSERT(sizeof(JC_REPORT) == 12);
+typedef enum {
+    JcStateDetached = 0,
+    JcStateDetectSettle,
+    JcStateMagic,
+    JcStateHandshake,
+    JcStateReadMac,
+    JcStateHidDisconnect,
+    JcStateHidConnect,
+    JcStateHidRate,
+    JcStateReportMode,
+    JcStateReady
+} JC_STATE;
+typedef struct {
+    WDFDEVICE Device;
+    WDFINTERRUPT Interrupt;
+    WDFTIMER Timer;
+    WDFIOTARGET Gpio;
+    KSPIN_LOCK TimerLock;
+    volatile ULONG *Uart;
+    VHFHANDLE Vhf;
+    BOOLEAN Powered, Running, IsLeft;
+    /* RX ring: the ISR fills it, the passive timer parses it. */
+    UCHAR Rx[JcRxCapacity];
+    ULONG RxHead, RxCount;
+    BOOLEAN RxLost;
+    /* Frame reassembly. */
+    UCHAR Frame[80];
+    ULONG FrameUsed, FrameWant;
+    ULONG FrameStart;
+    UCHAR Hdr[6];
+    ULONG DispCalls;
+    ULONG AckAny, AckAccepted, MacSent, MacReply, LastCmd, LastLen;
+    long DxFraction, DyFraction;
+    long CalSumX, CalSumY;
+    ULONG CalSamples;
+    SHORT CalCenterX, CalCenterY;
+    int CalLoX, CalHiX, CalLoY, CalHiY;
+    ULONG CalRestarts;
+    BOOLEAN CalLocked;
+    ULONG CalRejects;
+    ULONGLONG LastPointerTick;
+    UCHAR LastMouseButtons;
+    UCHAR MouseCandidate, MouseStable;
+    SHORT PrevAxis[2];
+    BOOLEAN HavePrevAxis;
+    ULONG PointerEnabled;
+    /* registry JcPointer (default 1) */
+    ULONG BadCrc, BadLen, AxisRejects, MouseRejects, RxLineErrors;
+    UCHAR LastRawButtons[3];
+    UCHAR LastFrame[16];
+    ULONG LastFrameBytes;
+    UCHAR LastArrows;
+    /* Last complete reply that a handshake state is waiting for. */
+    UCHAR Pending[80];
+    ULONG PendingLength;
+    BOOLEAN PendingValid;
+    JC_STATE State;
+    ULONG Retries;
+    ULONGLONG Deadline, NextAction;
+    UCHAR WaitCommand, WaitHeader;
+    UCHAR Mac[6];
+    UCHAR ControllerType;
+    UCHAR SubcmdNumber;
+    ULONGLONG LastReport, NextRequest;
+    ULONG ReportCount, ErrorCount, TimeoutCount;
+    ULONG RxBytes, TxPackets;
+    ULONG GpioReady, DetectLevel;
+    ULONG ScratchOk, LastLsr;
+    JC_PAD LastPad;
+    BOOLEAN PadValid;
+    ULONG ReportedState, ReportedCount, ReportedMac;
+    ULONG ReportedErrors, ReportedTimeouts, ReportedRx;
+    ULONGLONG NextTrace;
+    ULONG IrqVector, IrqCount;
+    ULONG LastIir, LastMsr, IerRead;
+    ULONG RxFirstWord;
+    UCHAR RxTail[64];
+    ULONG RxTailUsed;
+    ULONG IerProbe;
+    ULONG IrqRaw;
+    ULONG AckCount;
+    ULONG FrameCount;
+    ULONG FeedCalls;
+} JC_DEVICE;
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(JC_DEVICE, JcDevice) DRIVER_INITIALIZE DriverEntry;
+static EVT_WDF_DRIVER_DEVICE_ADD JcAdd;
+static EVT_WDF_DEVICE_PREPARE_HARDWARE JcPrepare;
+static EVT_WDF_DEVICE_RELEASE_HARDWARE JcRelease;
+static EVT_WDF_DEVICE_D0_ENTRY JcEnterD0;
+static EVT_WDF_DEVICE_D0_EXIT JcExitD0;
+static EVT_WDF_DEVICE_D0_ENTRY_POST_INTERRUPTS_ENABLED JcStart;
+static EVT_WDF_DEVICE_D0_EXIT_PRE_INTERRUPTS_DISABLED JcStop;
+static EVT_WDF_INTERRUPT_ISR JcReceive;
+static EVT_WDF_INTERRUPT_ENABLE JcEnable;
+static EVT_WDF_INTERRUPT_DISABLE JcDisable;
+static EVT_WDF_TIMER JcPoll;
+static EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL JcStatus;
+static ULONG JcRead(JC_DEVICE *D, ULONG Reg);
+static VOID JcWrite(JC_DEVICE *D, ULONG Reg, ULONG Value);
+/* ------------------------------------------------------------- registry log */
+static VOID JcWriteParam(JC_DEVICE *D, PCWSTR Name, ULONG Value)
+{
+    WDFKEY Key = NULL;
+    UNICODE_STRING ValueName;
+    if (!NT_SUCCESS(
+            WdfDeviceOpenRegistryKey(D->Device, PLUGPLAY_REGKEY_DEVICE, KEY_SET_VALUE, WDF_NO_OBJECT_ATTRIBUTES, &Key)))
+        return;
+    RtlInitUnicodeString(&ValueName, Name);
+    (VOID) WdfRegistryAssignULong(Key, &ValueName, Value);
+    WdfRegistryClose(Key);
+}
+static VOID JcWriteString(JC_DEVICE *D, PCWSTR Name, PCWSTR Value)
+{
+    WDFKEY Key = NULL;
+    UNICODE_STRING ValueName, Data;
+    if (!NT_SUCCESS(
+            WdfDeviceOpenRegistryKey(D->Device, PLUGPLAY_REGKEY_DEVICE, KEY_SET_VALUE, WDF_NO_OBJECT_ATTRIBUTES, &Key)))
+        return;
+    RtlInitUnicodeString(&ValueName, Name);
+    RtlInitUnicodeString(&Data, Value);
+    (VOID) WdfRegistryAssignUnicodeString(Key, &ValueName, &Data);
+    WdfRegistryClose(Key);
+}
+static ULONG JcReadParam(JC_DEVICE *D, PCWSTR Name, ULONG Default)
+{
+    WDFKEY Key = NULL;
+    UNICODE_STRING ValueName;
+    ULONG Value = Default;
+    if (!NT_SUCCESS(WdfDeviceOpenRegistryKey(D->Device, PLUGPLAY_REGKEY_DEVICE, KEY_QUERY_VALUE,
+                                             WDF_NO_OBJECT_ATTRIBUTES, &Key)))
+        return Default;
+    RtlInitUnicodeString(&ValueName, Name);
+    if (!NT_SUCCESS(WdfRegistryQueryULong(Key, &ValueName, &Value)))
+        Value = Default;
+    WdfRegistryClose(Key);
+    return Value;
+}
+/* JcReportState runs on every 2 ms poll, so every registry write in here is * gated: unconditional writes would be
+ * ~6k/s of I/O and starve the rail. */
+static VOID JcReportState(JC_DEVICE *D)
+{
+    if (D->ReportedState != (ULONG)D->State) {
+        D->ReportedState = (ULONG)D->State;
+        JcWriteParam(D, L"JcState", D->ReportedState);
+    }
+    if (KeQueryInterruptTime() < D->NextTrace)
+        return;
+    D->NextTrace = KeQueryInterruptTime() + MS_TO_100NS(1000);
+    D->ReportedCount = D->ReportCount;
+    D->ReportedErrors = D->ErrorCount;
+    D->ReportedTimeouts = D->TimeoutCount;
+    D->ReportedRx = D->RxBytes;
+    JcWriteParam(D, L"JcReports", D->ReportCount);
+    JcWriteParam(D, L"JcErrors", D->ErrorCount);
+    JcWriteParam(D, L"JcTimeouts", D->TimeoutCount);
+    JcWriteParam(D, L"JcRxBytes", D->RxBytes);
+    JcWriteParam(D, L"JcVer", (ULONG)JcVersion);
+    JcWriteParam(D, L"JcFeeds", D->FeedCalls);
+    JcWriteParam(D, L"JcFrames", D->FrameCount);
+    JcWriteParam(D, L"JcBadCrc", D->BadCrc);
+    JcWriteParam(D, L"JcBadLen", D->BadLen);
+    JcWriteParam(D, L"JcRxErr", D->RxLineErrors);
+    JcWriteParam(D, L"JcAxisRej", D->AxisRejects);
+    JcWriteParam(D, L"JcMouseRej", D->MouseRejects);
+    JcWriteParam(D, L"JcCalRej", D->CalRejects);
+    JcWriteParam(D, L"JcCalLock", D->CalLocked ? 1u : 0u);
+    JcWriteParam(D, L"JcCentre", ((ULONG)(USHORT)D->CalCenterX << 16) | (ULONG)(USHORT)D->CalCenterY);
+    JcWriteParam(D, L"JcPtrOn", D->PointerEnabled);
+    JcWriteParam(D, L"JcAckAny", D->AckAny);
+    JcWriteParam(D, L"JcAckAcc", D->AckAccepted);
+    JcWriteParam(D, L"JcMacSent", D->MacSent);
+    JcWriteParam(D, L"JcMacReply", D->MacReply);
+    JcWriteParam(D, L"JcLastCmd", D->LastCmd);
+    JcWriteParam(D, L"JcLastLen", D->LastLen);
+    JcWriteParam(D, L"JcWaitCmd", D->WaitCommand);
+    JcWriteParam(D, L"JcDisp", D->DispCalls);
+    JcWriteParam(D, L"JcH0", D->Hdr[0]);
+    JcWriteParam(D, L"JcH1", D->Hdr[1]);
+    JcWriteParam(D, L"JcH2", D->Hdr[2]);
+    JcWriteParam(D, L"JcH3", D->Hdr[3]);
+    JcWriteParam(D, L"JcH4", D->Hdr[4]);
+    JcWriteParam(D, L"JcH5", D->Hdr[5]);
+    JcWriteParam(D, L"JcWaitHdr", D->WaitHeader);
+    if (D->ReportedMac != ((ULONG)D->Mac[5] | ((ULONG)D->ControllerType << 8))) {
+        D->ReportedMac = (ULONG)D->Mac[5] | ((ULONG)D->ControllerType << 8);
+        JcWriteParam(D, L"JcMacType", D->ReportedMac);
+    }
+    {
+        JcWriteParam(D, L"JcDetect", D->GpioReady ? (0x100 | (D->DetectLevel & 1)) : 0xFF);
+        JcWriteParam(D, L"JcLsr", D->LastLsr);
+        JcWriteParam(D, L"JcScratch", D->ScratchOk ? 1u : 0u);
+        JcWriteParam(D, L"JcTxPackets", D->TxPackets);
+        JcWriteParam(D, L"JcIrq", (D->IrqCount << 16) | (D->IrqVector & 0xFFFF));
+        JcWriteParam(D, L"JcIir", D->LastIir);
+        JcWriteParam(D, L"JcIer", D->IerRead);
+        JcWriteParam(D, L"JcMsr", D->LastMsr);
+        JcWriteParam(D, L"JcRxFirst", D->RxFirstWord);
+        JcWriteParam(D, L"JcIrqRaw", D->IrqRaw);
+        JcWriteParam(D, L"JcAck", D->AckCount);
+        /* Raw button word and the head of the last accepted frame: this is what
+ * tells a real ZL press from a
+
+ * mis-parsed 0x30. */
+        JcWriteParam(D, L"JcLastBtn",
+                     (ULONG)D->LastRawButtons[0] | ((ULONG)D->LastRawButtons[1] << 8) |
+                         ((ULONG)D->LastRawButtons[2] << 16));
+        /* Keep the receive interrupt armed and remember what the register kept. */
+        JcWrite(D, JcIer, JcIerRx);
+        D->IerProbe = JcRead(D, JcIer) & 0xFF;
+        JcWriteParam(D, L"JcIerProbe", D->IerProbe);
+        {
+            WCHAR Hex[256];
+            static CONST WCHAR Digits[] = L"0123456789abcdef";
+            ULONG i, n = 0;
+            for (i = 0; i < D->LastFrameBytes && i < sizeof(D->LastFrame); ++i) {
+                Hex[n++] = Digits[(D->LastFrame[i] >> 4) & 0xF];
+                Hex[n++] = Digits[D->LastFrame[i] & 0xF];
+                Hex[n++] = L' ';
+            }
+            Hex[n] = 0;
+            JcWriteString(D, L"JcLastFrame", Hex);
+            n = 0;
+            for (i = 0; i < D->RxTailUsed && i < 64; ++i) {
+                Hex[n++] = Digits[(D->RxTail[i] >> 4) & 0xF];
+                Hex[n++] = Digits[D->RxTail[i] & 0xF];
+                Hex[n++] = L' ';
+            }
+            Hex[n] = 0;
+            JcWriteString(D, L"JcRxTail", Hex);
+        }
+    }
+}
+/* ------------------------------------------------------------- UART access */
+static ULONG JcRead(JC_DEVICE *D, ULONG Reg)
+{
+    return READ_REGISTER_ULONG((PULONG)&D->Uart[Reg]);
+}
+static VOID JcWrite(JC_DEVICE *D, ULONG Reg, ULONG Value)
+{
+    WRITE_REGISTER_ULONG((PULONG)&D->Uart[Reg], Value);
+}
+/* The UEFI firmware did the pad mux, the clock and the rail power.  Everything * here is inside the 0x70006040 /
+ * 0x70006200 window the ACPI device owns. */
+static VOID JcUartInit(JC_DEVICE *D)
+{
+    JcWrite(D, JcIer, 0);
+    JcWrite(D, JcLcr, 0x83);
+    /* divisor latch, 8N1 */
+    JcWrite(D, JcData, 1);
+    /* 16 MHz / 16 = 1 Mbaud */
+    JcWrite(D, JcLcr, 0x03);
+    JcWrite(D, JcIrda, JcInvertTxd | JcInvertRts);
+    /* the rail lines are inverted */
+    JcWrite(D, JcFcr, 0x87);
+    /* FIFO on, cleared, 14-byte trigger */
+    JcWrite(D, JcMcr, JcMcrRts);
+}
+static VOID JcUartOff(JC_DEVICE *D)
+{
+    JcWrite(D, JcIer, 0);
+    JcWrite(D, JcMcr, 0);
+}
+/* Bounded polled write; only used from the passive timer. */
+static BOOLEAN JcSendRaw(JC_DEVICE *D, const UCHAR *Bytes, ULONG Length)
+{
+    ULONGLONG End = KeQueryInterruptTime() + MS_TO_100NS(20);
+    for (ULONG i = 0; i < Length; ++i) {
+        while ((JcRead(D, JcLsr) & JcLsrTxEmpty) == 0) {
+            if (KeQueryInterruptTime() > End) {
+                ++D->ErrorCount;
+                return FALSE;
+            }
+            KeStallExecutionProcessor(2);
+        }
+        JcWrite(D, JcData, Bytes[i]);
+    }
+    return TRUE;
+}
+static BOOLEAN JcSendPacket(JC_DEVICE *D, UCHAR Command, const UCHAR Header[5], const UCHAR *Data, ULONG DataLength)
+{
+    JC_PACKET Packet;
+    if (!D->Powered)
+        return FALSE;
+    JcBuildPacket(&Packet, Command, Header, Data, DataLength);
+    if (!JcSendRaw(D, Packet.Header, JcHeaderSize))
+        return FALSE;
+    if (DataLength && !JcSendRaw(D, Packet.Data, DataLength))
+        return FALSE;
+    ++D->TxPackets;
+    return TRUE;
+}
+/* ------------------------------------------------------------- ACPI */
+/* Call the DSDT JINI(1) method: pad mux, exact 16 MHz UART clock and the * Joy-Con charge enable.  The driver cannot
+ * touch CAR (the CPU driver owns * that window), so AML does it, the same way the Lite SIO driver calls SPWR. */
+static NTSTATUS JcAcpiInit(WDFDEVICE Device, ULONG Enable)
+{
+    ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER Input;
+    ACPI_EVAL_OUTPUT_BUFFER Reply;
+    WDF_MEMORY_DESCRIPTOR In, Out;
+    WDF_REQUEST_SEND_OPTIONS Options;
+    ULONG_PTR Bytes = 0;
+    NTSTATUS Status;
+    RtlZeroMemory(&Input, sizeof(Input));
+    Input.Signature = ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_SIGNATURE;
+    RtlCopyMemory(Input.MethodName, "JINI", 4);
+    Input.IntegerArgument = Enable;
+    RtlZeroMemory(&Reply, sizeof(Reply));
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&In, &Input, sizeof(Input));
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&Out, &Reply, sizeof(Reply));
+    WDF_REQUEST_SEND_OPTIONS_INIT(&Options,
+                                  WDF_REQUEST_SEND_OPTION_TIMEOUT | WDF_REQUEST_SEND_OPTION_IGNORE_TARGET_STATE);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&Options, WDF_REL_TIMEOUT_IN_MS(1500));
+    Status = WdfIoTargetSendIoctlSynchronously(WdfDeviceGetIoTarget(Device), NULL, IOCTL_ACPI_EVAL_METHOD, &In, &Out,
+                                               &Options, &Bytes);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    if (Bytes < sizeof(Reply) || Reply.Signature != ACPI_EVAL_OUTPUT_BUFFER_SIGNATURE || Reply.Count != 1 ||
+        Reply.Argument[0].Type != ACPI_METHOD_ARGUMENT_INTEGER || Reply.Argument[0].DataLength != sizeof(ULONG) ||
+        Reply.Argument[0].Argument != 1)
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    return STATUS_SUCCESS;
+}
+/* ------------------------------------------------------------- detect GPIO */
+static BOOLEAN JcDetectLow(JC_DEVICE *D)
+{
+    UCHAR Pins = 0;
+    ULONG_PTR Bytes = 0;
+    WDF_MEMORY_DESCRIPTOR Out;
+    WDF_REQUEST_SEND_OPTIONS Options;
+    if (!D->Gpio) {
+        D->GpioReady = 0;
+        return TRUE;
+    }
+    /* no pin: assume attached */
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&Out, &Pins, sizeof(Pins));
+    WDF_REQUEST_SEND_OPTIONS_INIT(&Options, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&Options, WDF_REL_TIMEOUT_IN_MS(30));
+    if (!NT_SUCCESS(
+            WdfIoTargetSendIoctlSynchronously(D->Gpio, NULL, IOCTL_GPIO_READ_PINS, NULL, &Out, &Options, &Bytes)) ||
+        Bytes != sizeof(Pins)) {
+        D->GpioReady = 2;
+        /* resource present, read failed */
+        return FALSE;
+    }
+    D->GpioReady = 1;
+    D->DetectLevel = Pins & 1;
+    return !(Pins & 1);
+    /* active low */
+}
+/* ------------------------------------------------------------- HID */
+static VOID JcSubmitPointer(JC_DEVICE *D, const JC_PAD *Pad)
+{
+    JC_MOUSE_REPORT Report;
+    JC_KEYBOARD_REPORT Keys;
+    HID_XFER_PACKET Xfer;
+    ULONGLONG Now = KeQueryInterruptTime();
+    ULONG Ms;
+    UCHAR Buttons = 0, Candidate = 0, Arrows = 0;
+    SHORT Ax, Ay;
+    static CONST UCHAR ArrowUsage[4] = {0x51, 0x52, 0x4F, 0x50};
+    /* Down Up Right Left */
+    if (!D->Vhf)
+        return;
+    if (!D->PointerEnabled)
+        return;
+    Ms = (ULONG)((Now - D->LastPointerTick) / 10000);
+    if (Ms > 32)
+        Ms = 32;
+    if (Ms == 0)
+        Ms = 1;
+    D->LastPointerTick = Now;
+    /* Left/ZL -> left click, Right/ZR -> right click, stick press -> middle. */
+    if (Pad->Buttons & ((1u << 6) | (1u << 4)))
+        Candidate |= 1u;
+    if (Pad->Buttons & ((1u << 7) | (1u << 5)))
+        Candidate |= 2u;
+    if (Pad->Buttons & ((1u << 10) | (1u << 11)))
+        Candidate |= 4u;
+    /* A single frame is never enough: a mis-parsed 0x30 shows up as one frame of
+ * pressed bits, a real press stays
+
+ * for ~15 ms (2+ frames). */
+    if (Candidate == D->MouseCandidate)
+        D->MouseStable = Candidate;
+    else {
+        D->MouseCandidate = Candidate;
+        ++D->MouseRejects;
+    }
+    Buttons = D->MouseStable;
+    /* Same idea for the stick: a real stick cannot jump JcAxisJump in 15 ms. */
+    Ax = Pad->Axis[0];
+    Ay = Pad->Axis[1];
+    if (D->HavePrevAxis) {
+        LONG dx = (LONG)Ax - D->PrevAxis[0];
+        LONG dy = (LONG)Ay - D->PrevAxis[1];
+        if (dx > JcAxisJump || dx < -(LONG)JcAxisJump || dy > JcAxisJump || dy < -(LONG)JcAxisJump) {
+            ++D->AxisRejects;
+            Ax = D->PrevAxis[0];
+            Ay = D->PrevAxis[1];
+        }
+    }
+    D->PrevAxis[0] = Ax;
+    D->PrevAxis[1] = Ay;
+    D->HavePrevAxis = TRUE;
+    Report.Id = 2;
+    Report.Buttons = Buttons;
+    Report.Dx = JcPointerAxis(Ax, Ms, &D->DxFraction);
+    Report.Dy = JcPointerAxis(Ay, Ms, &D->DyFraction);
+    Report.Wheel = 0;
+    Report.Pan = 0;
+    if (Buttons || Report.Dx || Report.Dy || D->LastMouseButtons) {
+        Xfer.reportBuffer = (PUCHAR)&Report;
+        Xfer.reportBufferLen = sizeof(Report);
+        Xfer.reportId = 2;
+        (VOID) VhfReadReportSubmit(D->Vhf, &Xfer);
+        D->LastMouseButtons = Buttons;
+    }
+    /* D-pad -> arrow keys. */
+    if (Pad->Hat < 8)
+        Arrows = (UCHAR)(1u << Pad->Hat);
+    if (Arrows != D->LastArrows) {
+        RtlZeroMemory(&Keys, sizeof(Keys));
+        Keys.Id = 3;
+        {
+            ULONG n = 0;
+            for (ULONG b = 0; b < 8 && n < 6; ++b) {
+                if (Arrows & (1u << b)) {
+                    Keys.Keys[n++] = ArrowUsage[0];
+                }
+            }
+        }
+        Xfer.reportBuffer = (PUCHAR)&Keys;
+        Xfer.reportBufferLen = sizeof(Keys);
+        Xfer.reportId = 3;
+        (VOID) VhfReadReportSubmit(D->Vhf, &Xfer);
+        D->LastArrows = Arrows;
+    }
+}
+static NTSTATUS JcStartHid(JC_DEVICE *D)
+{
+    VHF_CONFIG C;
+    NTSTATUS Status;
+    VHF_CONFIG_INIT(&C, WdfDeviceWdmGetDeviceObject(D->Device), sizeof(JcReportDescriptor), JcReportDescriptor);
+    Status = VhfCreate(&C, &D->Vhf);
+    if (NT_SUCCESS(Status)) {
+        Status = VhfStart(D->Vhf);
+        if (!NT_SUCCESS(Status)) {
+            VhfDelete(D->Vhf, TRUE);
+            D->Vhf = NULL;
+        }
+
+    } else {
+        D->Vhf = NULL;
+    }
+    return Status;
+}
+static VOID JcSubmitPad(JC_DEVICE *D, const JC_PAD *Pad)
+{
+    JC_REPORT Report;
+    HID_XFER_PACKET Xfer;
+    if (!D->Vhf)
+        return;
+    Report.Id = 1;
+    Report.Buttons = (USHORT)Pad->Buttons;
+    Report.Hat = Pad->Hat;
+    RtlCopyMemory(Report.Axis, Pad->Axis, sizeof(Report.Axis));
+    Xfer.reportBuffer = (PUCHAR)&Report;
+    Xfer.reportBufferLen = sizeof(Report);
+    Xfer.reportId = 1;
+    (VOID) VhfReadReportSubmit(D->Vhf, &Xfer);
+}
+static VOID JcSubmitNeutral(JC_DEVICE *D)
+{
+    JC_PAD Pad = {0};
+    if (!D->PadValid)
+        return;
+    Pad.Hat = 8;
+    JcSubmitPad(D, &Pad);
+    /* Drop a latched pointer button too: a detach in the middle of a click would
+ * otherwise leave the button held
+
+ * down until the next report. */
+    D->MouseCandidate = D->MouseStable = 0;
+    D->HavePrevAxis = FALSE;
+    JcSubmitPointer(D, &Pad);
+    D->PadValid = FALSE;
+}
+/* ------------------------------------------------------------- report parse */
+static UCHAR JcHatFromButtons(ULONG Buttons)
+{
+    int X = ((Buttons & JcBtnRight) ? 1 : 0) - ((Buttons & JcBtnLeft) ? 1 : 0);
+    int Y = ((Buttons & JcBtnDown) ? 1 : 0) - ((Buttons & JcBtnUp) ? 1 : 0);
+    static const UCHAR Hat[3][3] = {{7, 0, 1}, {6, 8, 2}, {5, 4, 3}
+
+    };
+    return Hat[Y + 1][X + 1];
+}
+/* Report data layout (see PROTOCOL.md 闂?.2): id, timer, bat_con, buttons[3], * left_stick[3], right_stick[3],
+ * vibrator, then reply or IMU samples. */
+static VOID JcParseInputReport(JC_DEVICE *D, const UCHAR *Report, ULONG Length)
+{
+    /* Must be zeroed: a right Joy-Con never writes Axis[0]/Axis[1] and a left one
+ * never writes Axis[2]/Axis[3].
+
+ * Leaving those as stack garbage is what made
+ * the pointer jump: the right rail's mouse collection was fed
+
+ * random Dx/Dy. */
+    JC_PAD Pad = {0};
+    ULONG Buttons, Stick;
+    const UCHAR *StickBytes;
+    if (Length < JcReportBase) {
+        ++D->ErrorCount;
+        return;
+    }
+    /* Only the standard full report carries the live button/stick state; a 0x21
+ * subcommand reply has raw reply
+
+ * bytes in the same offsets (phantom clicks). */
+    if (Report[0] != JcInputImuData)
+        return;
+    /* A 0x30 payload is 13 bytes + n*12 of IMU samples; anything else is a frame
+ * we mis-framed, and its "buttons"
+
+ * are random bytes. */
+    if (Length > JcReportMax || (Length - JcReportBase) % JcReportStride != 0) {
+        ++D->BadLen;
+        return;
+    }
+    D->LastReport = KeQueryInterruptTime();
+    ++D->ReportCount;
+    D->LastRawButtons[0] = Report[3];
+    D->LastRawButtons[1] = Report[4];
+    D->LastRawButtons[2] = Report[5];
+    Buttons = JcField24(Report + 3);
+    Pad.Buttons = 0;
+    /* HID descriptor order: A B X Y L R ZL ZR - + LStick RStick Home Capture */
+    if (Buttons & JcBtnA)
+        Pad.Buttons |= 1u << 0;
+    if (Buttons & JcBtnB)
+        Pad.Buttons |= 1u << 1;
+    if (Buttons & JcBtnX)
+        Pad.Buttons |= 1u << 2;
+    if (Buttons & JcBtnY)
+        Pad.Buttons |= 1u << 3;
+    if (Buttons & JcBtnL)
+        Pad.Buttons |= 1u << 4;
+    if (Buttons & JcBtnR)
+        Pad.Buttons |= 1u << 5;
+    if (Buttons & JcBtnZl)
+        Pad.Buttons |= 1u << 6;
+    if (Buttons & JcBtnZr)
+        Pad.Buttons |= 1u << 7;
+    if (Buttons & JcBtnMinus)
+        Pad.Buttons |= 1u << 8;
+    if (Buttons & JcBtnPlus)
+        Pad.Buttons |= 1u << 9;
+    if (Buttons & JcBtnLStick)
+        Pad.Buttons |= 1u << 10;
+    if (Buttons & JcBtnRStick)
+        Pad.Buttons |= 1u << 11;
+    if (Buttons & JcBtnHome)
+        Pad.Buttons |= 1u << 12;
+    if (Buttons & JcBtnCapture)
+        Pad.Buttons |= 1u << 13;
+    /* SR/SL share the trigger bits so a rail-only Joy-Con still reaches them. */
+    if (Buttons & (JcBtnSlL | JcBtnSlR))
+        Pad.Buttons |= 1u << 4;
+    if (Buttons & (JcBtnSrL | JcBtnSrR))
+        Pad.Buttons |= 1u << 5;
+    Pad.Hat = JcHatFromButtons(Buttons);
+    StickBytes = D->IsLeft ? Report + 6 : Report + 9;
+    Stick = (ULONG)StickBytes[0] | ((ULONG)StickBytes[1] << 8) | ((ULONG)StickBytes[2] << 16);
+    {
+        int RawX = (int)(Stick & 0xFFF);
+        int RawY = (int)(Stick >> 12);
+        /* Only frames from the settled pipeline may teach us the centre: a report
+ * accepted while still
+
+ * handshaking carries whatever the rail happened to
+ * hold, and a centre computed from that pins the
+
+ * axis at one end. */
+        if (D->State == JcStateReady)
+            JcCalFeed(D, RawX, RawY);
+        if (D->IsLeft) {
+            Pad.Axis[0] = JcMapStick(RawX, D->CalCenterX, JcCalMin, JcCalMax);
+            Pad.Axis[1] = (SHORT)-JcMapStick(RawY, D->CalCenterY, JcCalMin, JcCalMax);
+
+        } else {
+            Pad.Axis[2] = JcMapStick(RawX, D->CalCenterX, JcCalMin, JcCalMax);
+            Pad.Axis[3] = (SHORT)-JcMapStick(RawY, D->CalCenterY, JcCalMin, JcCalMax);
+        }
+    }
+    JcSubmitPointer(D, &Pad);
+    D->LastPad = Pad;
+    D->PadValid = TRUE;
+    JcSubmitPad(D, &Pad);
+}
+/* ------------------------------------------------------------- stick centre */
+static VOID JcCalReset(JC_DEVICE *D)
+{
+    D->CalSumX = D->CalSumY = 0;
+    D->CalSamples = 0;
+    D->CalLoX = D->CalLoY = 0x7FFF;
+    D->CalHiX = D->CalHiY = -1;
+}
+static VOID JcCalGiveUp(JC_DEVICE *D)
+{
+    D->CalLocked = TRUE;
+    D->CalCenterX = JcCalCentre;
+    D->CalCenterY = JcCalCentre;
+}
+/* Average 32 still frames.  A single wild sample (a frame we accepted mid * handshake, a rail glitch) or a window that
+ * drifts means "not still yet", so * the window restarts instead of baking a wrong centre into every later report. */
+static VOID JcCalFeed(JC_DEVICE *D, int RawX, int RawY)
+{
+    int MeanX, MeanY, CentreX, CentreY;
+    if (D->CalLocked)
+        return;
+    if (D->CalSamples) {
+        MeanX = (int)(D->CalSumX / (long)D->CalSamples);
+        MeanY = (int)(D->CalSumY / (long)D->CalSamples);
+        if (RawX - MeanX > JcCalOutlier || MeanX - RawX > JcCalOutlier || RawY - MeanY > JcCalOutlier ||
+            MeanY - RawY > JcCalOutlier) {
+            ++D->CalRejects;
+            if (++D->CalRestarts > JcCalRestartMax)
+                JcCalGiveUp(D);
+            else
+                JcCalReset(D);
+            return;
+        }
+    }
+    D->CalSumX += RawX;
+    D->CalSumY += RawY;
+    if (RawX < D->CalLoX)
+        D->CalLoX = RawX;
+    if (RawX > D->CalHiX)
+        D->CalHiX = RawX;
+    if (RawY < D->CalLoY)
+        D->CalLoY = RawY;
+    if (RawY > D->CalHiY)
+        D->CalHiY = RawY;
+    ++D->CalSamples;
+    if (D->CalSamples < JcCalCount)
+        return;
+    if (D->CalHiX - D->CalLoX > JcCalSpread || D->CalHiY - D->CalLoY > JcCalSpread) {
+        /* The stick moved while we were measuring: start over. */
+        ++D->CalRejects;
+        if (++D->CalRestarts > JcCalRestartMax)
+            JcCalGiveUp(D);
+        else
+            JcCalReset(D);
+        return;
+    }
+    CentreX = (int)(D->CalSumX / JcCalCount);
+    CentreY = (int)(D->CalSumY / JcCalCount);
+    if (CentreX < JcCalSaneMin || CentreX > JcCalSaneMax || CentreY < JcCalSaneMin || CentreY > JcCalSaneMax) {
+        if (++D->CalRestarts > JcCalRestartMax)
+            JcCalGiveUp(D);
+        else
+            JcCalReset(D);
+        return;
+    }
+    D->CalCenterX = (SHORT)CentreX;
+    D->CalCenterY = (SHORT)CentreY;
+    D->CalLocked = TRUE;
+}
+/* Packet = complete 19 81 03 frame (header[14] + size bytes). */
+static VOID JcDispatch(JC_DEVICE *D, const UCHAR *Packet, ULONG Length)
+{
+    UCHAR Command;
+    const UCHAR *Data;
+    if (Length >= 6)
+        RtlCopyMemory(D->Hdr, Packet, 6);
+    D->DispCalls++;
+    ULONG DataLength;
+    if (Length < JcHeaderSize)
+        return;
+    if (Packet[0] != JcRxMagic0 || Packet[1] != JcRxMagic1 || Packet[2] != JcRxMagic2) {
+        ++D->ErrorCount;
+        return;
+    }
+    /* Frame integrity: the RX frame carries the same CRC8 over pad..header_data as
+ * the TX one (checked against a
+
+ * real capture: 19 81 03 07 00 a5 02 02 7d 00 00 64
+ * -> crc 0x64). This is what keeps junk bytes from decoding
+
+ * as button presses. */
+    {
+        BOOLEAN Bad = FALSE;
+        if ((ULONG)Packet[3] + 5u != Length) {
+            ++D->BadLen;
+            Bad = TRUE;
+
+        } else if (Packet[11] != JcCrc8(&Packet[4], 7)) {
+            ++D->BadCrc;
+            Bad = TRUE;
+        }
+        /* While handshaking, keep accepting a frame we are not sure about: an
+ * over-strict filter would make
+
+ * an attach impossible to bring up, and
+ * phantom input only matters once the pipeline is Ready. */
+        if (Bad && D->State == JcStateReady) {
+            /* The bytes we just consumed were not a frame, so the assembler is
+ * out of step: throw away
+
+ * what it holds and hunt for a magic anew. */
+            D->FrameUsed = 0;
+            D->FrameStart = 0xFFFFFFFF;
+            return;
+        }
+    }
+    D->LastFrameBytes = Length < sizeof(D->LastFrame) ? Length : sizeof(D->LastFrame);
+    RtlCopyMemory(D->LastFrame, Packet, D->LastFrameBytes);
+    Command = Packet[5];
+    Data = Packet + JcHeaderSize;
+    D->LastCmd = Command;
+    D->LastLen = Length;
+    DataLength = Length - JcHeaderSize;
+    /* 0xA5 handshake replies are matched on the command byte only (switchroot
+ * does the same): the reply's header
+
+ * data is not what we sent. */
+    if (Command == JcCmdHandshake) {
+        ++D->AckCount;
+        ++D->AckAny;
+        if (D->WaitCommand == JcCmdHandshake) {
+            RtlCopyMemory(D->Pending, Packet, Length < sizeof(D->Pending) ? Length : sizeof(D->Pending));
+            D->PendingLength = Length;
+            D->PendingValid = TRUE;
+            ++D->AckAccepted;
+        }
+        return;
+    }
+    /* Init replies: 0x94 (INITRET) with the expected init code in header_data[0]. */
+    if (Command == JcCmdInitRet) {
+        if (D->WaitCommand == JcCmdInitRet && Packet[6] == D->WaitHeader) {
+            ++D->MacReply;
+            RtlCopyMemory(D->Pending, Packet, Length < sizeof(D->Pending) ? Length : sizeof(D->Pending));
+            D->PendingLength = Length;
+            D->PendingValid = TRUE;
+        }
+        return;
+    }
+    if (Command == JcCmdExtRet) {
+        if (DataLength >= 15 && Data[0] == JcInputSubcmdReply) {
+            if (D->WaitCommand == JcCmdExtRet && Data[14] == D->WaitHeader) {
+                RtlCopyMemory(D->Pending, Packet, Length < sizeof(D->Pending) ? Length : sizeof(D->Pending));
+                D->PendingLength = Length;
+                D->PendingValid = TRUE;
+            }
+            return;
+        }
+        if (DataLength >= 13)
+            JcParseInputReport(D, Data, DataLength);
+        else
+            ++D->ErrorCount;
+    }
+}
+static VOID JcFeed(JC_DEVICE *D, UCHAR Byte)
+{
+    ++D->FeedCalls;
+    if (D->FrameStart != 0xFFFFFFFF) {
+        if (D->FrameUsed >= sizeof(D->Frame)) {
+            D->FrameUsed = 0;
+            D->FrameStart = 0xFFFFFFFF;
+            return;
+        }
+        D->Frame[D->FrameUsed++] = Byte;
+        if (D->FrameUsed >= D->FrameStart + D->FrameWant) {
+            RtlMoveMemory(D->Frame, D->Frame + D->FrameStart, D->FrameWant);
+            D->FrameUsed = 0;
+            D->FrameStart = 0xFFFFFFFF;
+            ++D->FrameCount;
+            JcDispatch(D, D->Frame, D->FrameWant);
+        }
+        return;
+    }
+    if (D->FrameUsed >= sizeof(D->Frame))
+        D->FrameUsed = 0;
+    D->Frame[D->FrameUsed++] = Byte;
+    if (D->FrameUsed < 4)
+        return;
+    {
+        ULONG Start = D->FrameUsed - 4;
+        if (D->Frame[Start] == JcRxMagic0 && D->Frame[Start + 1] == JcRxMagic1 && D->Frame[Start + 2] == JcRxMagic2) {
+            ULONG Size = D->Frame[Start + 3];
+            ULONG Want = Size + 5u;
+            if (Size >= 7 && Want <= sizeof(D->Frame)) {
+                D->FrameStart = Start;
+                D->FrameWant = Want;
+
+            } else {
+                D->FrameUsed = 0;
+            }
+        }
+    }
+}
+static VOID JcBeginStep(JC_DEVICE *D, JC_STATE State, UCHAR WaitCommand, UCHAR WaitHeader)
+{
+    D->State = State;
+    D->WaitCommand = WaitCommand;
+    D->WaitHeader = WaitHeader;
+    D->PendingValid = FALSE;
+    D->Retries = 0;
+    D->Deadline = KeQueryInterruptTime() + MS_TO_100NS(JcWaitMs);
+    JcReportState(D);
+}
+/* TRUE once the current step has timed out (and the whole attach gave up). */
+static BOOLEAN JcStepExpired(JC_DEVICE *D, ULONGLONG Now)
+{
+    if (Now < D->Deadline)
+        return FALSE;
+    ++D->TimeoutCount;
+    if (++D->Retries >= JcHandshakeRetries) {
+        D->State = JcStateDetached;
+        D->WaitCommand = D->WaitHeader = 0;
+        D->NextAction = Now + MS_TO_100NS(JcReinitMs);
+        JcReportState(D);
+        return TRUE;
+    }
+    D->Deadline = Now + MS_TO_100NS(JcWaitMs);
+    return FALSE;
+}
+static CONST UCHAR JcHeaderMac[5] = {JcInitMac, 0, 0, 0, 0};
+static CONST UCHAR JcHeaderHandshake[5] = {0x02, 0x01, 0x7E, 0, 0};
+static CONST UCHAR JcHeaderHidOff[5] = {JcInitHidDisconnect, 0, 0, 0, 0};
+static CONST UCHAR JcHeaderHidOn[5] = {JcInitHidConnect, 0, 0, 0, 0};
+static CONST UCHAR JcHeaderHidRate[5] = {JcInitSetHidRate, 0x04, 0x00, 0x00, 0x12};
+static CONST UCHAR JcRateData[4] = {0x0F, 0x00, 0x00, 0x00};
+static CONST UCHAR JcMagic[4] = {0xA1, 0xA2, 0xA3, 0xA4};
+static CONST UCHAR JcReportRequestHeader[5] = {0x00, 0x01, 0x00, 0x00, 0x69};
+static CONST UCHAR JcReportRequest[1] = {JcSubcmdRequestReport};
+static BOOLEAN JcSendSubcmd(JC_DEVICE *D, UCHAR Subcmd, const UCHAR *Payload, ULONG PayloadLength)
+{
+    UCHAR Data[32];
+    UCHAR Header[5] = {0, 0, 0, 0, 0};
+    ULONG CommandLength = 11 + PayloadLength;
+    /* output_id + num + rumble[8] + subcmd + payload */
+    if (CommandLength > sizeof(Data))
+        return FALSE;
+    Data[0] = JcOutputRumbleSubcmd;
+    Data[1] = D->SubcmdNumber;
+    D->SubcmdNumber = (UCHAR)((D->SubcmdNumber + 1) & 0xF);
+    /* Canonical neutral rumble package (all-zero data can be read as a rumble
+     * request by some Joy-Con firmware).
+     */
+    Data[2] = 0x00;
+    Data[3] = 0x01;
+    Data[4] = 0x40;
+    Data[5] = 0x40;
+    Data[6] = 0x00;
+    Data[7] = 0x01;
+    Data[8] = 0x40;
+    Data[9] = 0x40;
+    Data[10] = Subcmd;
+    for (ULONG i = 0; i < PayloadLength; ++i)
+        Data[11 + i] = Payload[i];
+    Header[0] = (UCHAR)(CommandLength >> 8);
+    Header[1] = (UCHAR)(CommandLength & 0xFF);
+    return JcSendPacket(D, JcCmdExtRet, Header, Data, CommandLength);
+}
+static VOID JcEnterReady(JC_DEVICE *D)
+{
+    D->State = JcStateReady;
+    D->WaitCommand = D->WaitHeader = 0;
+    D->LastReport = KeQueryInterruptTime();
+    D->NextRequest = 0;
+    D->PadValid = FALSE;
+    /* Fresh filters: the first Ready report must not be compared with values
+     * left over from before a detach/home.
+     */
+    D->MouseCandidate = D->MouseStable = 0;
+    D->LastMouseButtons = 0;
+    D->HavePrevAxis = FALSE;
+    D->LastPointerTick = KeQueryInterruptTime();
+    /* A failed calibration retries on the next attach, a good one is kept. */
+    if (!D->CalLocked)
+        JcCalReset(D);
+    JcReportState(D);
+}
+static VOID JcStep(JC_DEVICE *D, ULONGLONG Now)
+{
+    switch (D->State) {
+    case JcStateDetached:
+        if (Now < D->NextAction || !JcDetectLow(D))
+            return;
+        D->State = JcStateDetectSettle;
+        D->NextAction = Now + MS_TO_100NS(JcDetectStableMs);
+        JcReportState(D);
+        return;
+    case JcStateDetectSettle:
+        if (Now < D->NextAction)
+            return;
+        if (!JcDetectLow(D)) {
+            D->State = JcStateDetached;
+            JcReportState(D);
+            return;
+        }
+        JcUartInit(D);
+        D->RxHead = D->RxCount = 0;
+        D->FrameUsed = 0;
+        D->RxLost = FALSE;
+        D->PendingValid = FALSE;
+        D->ReportCount = 0;
+        D->State = JcStateMagic;
+        D->Retries = 0;
+        D->Deadline = Now + MS_TO_100NS(JcWaitMs);
+        JcReportState(D);
+        return;
+    case JcStateMagic:
+        if (D->PendingValid) {
+            JcBeginStep(D, JcStateHandshake, JcCmdHandshake, 0xA5);
+            return;
+        }
+        if (JcStepExpired(D, Now))
+            return;
+        (VOID) JcSendRaw(D, JcMagic, sizeof(JcMagic));
+        (VOID) JcSendPacket(D, JcCmdHandshake, JcHeaderHandshake, NULL, 0);
+        JcBeginStep(D, JcStateHandshake, JcCmdHandshake, 0xA5);
+        return;
+    case JcStateHandshake:
+        if (D->PendingValid) {
+            JcBeginStep(D, JcStateReadMac, JcCmdInitRet, JcInitMac);
+            ++D->MacSent;
+            (VOID) JcSendPacket(D, JcCmdExtSend, JcHeaderMac, NULL, 0);
+            return;
+        }
+        if (JcStepExpired(D, Now)) {
+            (VOID) JcSendRaw(D, JcMagic, sizeof(JcMagic));
+            return;
+        }
+        (VOID) JcSendPacket(D, JcCmdHandshake, JcHeaderHandshake, NULL, 0);
+        return;
+    case JcStateReadMac:
+        if (D->PendingValid) {
+            if (D->PendingLength >= JcHeaderSize + 7) {
+                D->ControllerType = D->Pending[JcHeaderSize + 0];
+                for (ULONG i = 0; i < 6; ++i)
+                    D->Mac[i] = D->Pending[JcHeaderSize + 6 - i];
+            }
+            JcBeginStep(D, JcStateHidDisconnect, JcCmdInitRet, JcInitHidDisconnect);
+            (VOID) JcSendPacket(D, JcCmdExtSend, JcHeaderHidOff, NULL, 0);
+            return;
+        }
+        if (JcStepExpired(D, Now))
+            return;
+        (VOID) JcSendPacket(D, JcCmdExtSend, JcHeaderMac, NULL, 0);
+        return;
+    case JcStateHidDisconnect:
+        if (D->PendingValid) {
+            JcBeginStep(D, JcStateHidConnect, JcCmdInitRet, JcInitHidConnect);
+            (VOID) JcSendPacket(D, JcCmdExtSend, JcHeaderHidOn, NULL, 0);
+            return;
+        }
+        if (JcStepExpired(D, Now))
+            return;
+        (VOID) JcSendPacket(D, JcCmdExtSend, JcHeaderHidOff, NULL, 0);
+        return;
+    case JcStateHidConnect:
+        if (D->PendingValid) {
+            JcBeginStep(D, JcStateHidRate, JcCmdInitRet, JcInitSetHidRate);
+            (VOID) JcSendPacket(D, JcCmdExtSend, JcHeaderHidRate, JcRateData, sizeof(JcRateData));
+            return;
+        }
+        if (JcStepExpired(D, Now))
+            return;
+        (VOID) JcSendPacket(D, JcCmdExtSend, JcHeaderHidOn, NULL, 0);
+        return;
+    case JcStateHidRate:
+        if (D->PendingValid) {
+            UCHAR Mode = JcInputImuData;
+            /* report mode 0x30 */
+            JcBeginStep(D, JcStateReportMode, JcCmdExtRet, JcSubcmdSetReportMode);
+            (VOID) JcSendSubcmd(D, JcSubcmdSetReportMode, &Mode, 1);
+            return;
+        }
+        if (JcStepExpired(D, Now))
+            return;
+        (VOID) JcSendPacket(D, JcCmdExtSend, JcHeaderHidRate, JcRateData, sizeof(JcRateData));
+        return;
+    case JcStateReportMode: /* The reply may be dropped; reports flowing is just as good a sign. */
+        if (D->PendingValid || D->ReportCount != 0) {
+            JcEnterReady(D);
+            return;
+        }
+        if (Now >= D->Deadline) {
+            JcEnterReady(D);
+            return;
+        }
+        return;
+    case JcStateReady:
+        if (Now - D->LastReport > MS_TO_100NS(JcDetachMs)) {
+            JcSubmitNeutral(D);
+            D->State = JcStateDetached;
+            D->PadValid = FALSE;
+            D->NextAction = Now + MS_TO_100NS(JcReinitMs);
+            JcReportState(D);
+            return;
+        }
+        if (Now >= D->NextRequest) {
+            (VOID) JcSendPacket(D, JcCmdExtRet, JcReportRequestHeader, JcReportRequest, sizeof(JcReportRequest));
+            D->NextRequest = Now + MS_TO_100NS(JcReportRequestMs);
+        }
+        return;
+    default:
+        D->State = JcStateDetached;
+        JcReportState(D);
+        return;
+    }
+}
+/* ------------------------------------------------------------- timer */
+static VOID JcPoll(WDFTIMER Timer)
+{
+    JC_DEVICE *D = JcDevice((WDFDEVICE)WdfTimerGetParentObject(Timer));
+    UCHAR Bytes[128];
+    ULONGLONG Now = KeQueryInterruptTime();
+    /* Polled drain first: if the interrupt line never fires we still see the
+ * bytes the controller sends.  These
+
+ * only fill the ring -- the parser has a
+ * single consumer below, otherwise every byte is decoded twice and
+
+ * frames
+ * interleave with their own copies. */
+    WdfInterruptAcquireLock(D->Interrupt);
+    for (;;) {
+        ULONG Lsr = JcRead(D, JcLsr);
+        UCHAR Byte;
+        if ((Lsr & JcLsrDataReady) == 0 || D->RxCount >= JcRxCapacity)
+            break;
+        Byte = (UCHAR)JcRead(D, JcData);
+        if (Lsr & JcLsrErrors) {
+            /* Framing/overrun error: this byte is not what the controller sent.
+ * Keep it out of the frame
+
+ * assembler and start looking for a magic
+ * again, otherwise one bad byte poisons every
+
+ * following frame. */
+            ++D->RxLineErrors;
+            D->FrameUsed = 0;
+            D->FrameStart = 0xFFFFFFFF;
+            continue;
+        }
+        if (D->RxFirstWord == 0)
+            D->RxFirstWord = Byte ? (ULONG)Byte : 0x100;
+        if (D->RxTailUsed < sizeof(D->RxTail))
+            D->RxTail[D->RxTailUsed++] = Byte;
+        else {
+            RtlMoveMemory(D->RxTail, D->RxTail + 1, sizeof(D->RxTail) - 1);
+            D->RxTail[sizeof(D->RxTail) - 1] = Byte;
+        }
+        ++D->RxBytes;
+        D->Rx[(D->RxHead + D->RxCount) % JcRxCapacity] = Byte;
+        ++D->RxCount;
+    }
+    WdfInterruptReleaseLock(D->Interrupt);
+    /* Drain the ring into the frame parser; parsing runs outside the lock. */
+    for (ULONG Batch = 0; Batch < JcRxCapacity / sizeof(Bytes); ++Batch) {
+        ULONG Count, First;
+        WdfInterruptAcquireLock(D->Interrupt);
+        if (D->RxLost) {
+            D->RxLost = FALSE;
+            D->RxCount = D->RxHead = 0;
+            D->FrameUsed = 0;
+        }
+        Count = D->RxCount < sizeof(Bytes) ? D->RxCount : sizeof(Bytes);
+        First = Count < JcRxCapacity - D->RxHead ? Count : JcRxCapacity - D->RxHead;
+        RtlCopyMemory(Bytes, D->Rx + D->RxHead, First);
+        RtlCopyMemory(Bytes + First, D->Rx, Count - First);
+        D->RxHead = (D->RxHead + Count) % JcRxCapacity;
+        D->RxCount -= Count;
+        WdfInterruptReleaseLock(D->Interrupt);
+        for (ULONG i = 0; i < Count; ++i)
+            JcFeed(D, Bytes[i]);
+        if (Count < sizeof(Bytes))
+            break;
+    }
+    JcStep(D, Now);
+    D->LastLsr = JcRead(D, JcLsr);
+    D->LastIir = JcRead(D, JcIir) & 0xFF;
+    D->LastMsr = JcRead(D, JcMsr) & 0xFF;
+    D->IerRead = JcRead(D, JcIer) & 0xFF;
+    JcReportState(D);
+    if (D->Running) {
+        KIRQL Irql;
+        KeAcquireSpinLock(&D->TimerLock, &Irql);
+        WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_MS(D->State == JcStateReady ? JcPollMs : 5));
+        KeReleaseSpinLock(&D->TimerLock, Irql);
+    }
+}
+/* ------------------------------------------------------------- interrupt */
+static BOOLEAN JcReceive(WDFINTERRUPT Interrupt, ULONG MessageId)
+{
+    JC_DEVICE *D = JcDevice((WDFDEVICE)WdfInterruptGetDevice(Interrupt));
+    BOOLEAN Serviced = FALSE;
+    UNREFERENCED_PARAMETER(MessageId);
+    for (ULONG Guard = 0; Guard < 64; ++Guard) {
+        ULONG Iir = JcRead(D, JcIir);
+        if (Iir & 1)
+            break;
+        /* no interrupt pending */
+        Serviced = TRUE;
+        if ((Iir & 0x0E) == 0x06) {
+            /* line status */
+            (VOID) JcRead(D, JcLsr);
+            ++D->ErrorCount;
+        }
+        if ((Iir & 0x0E) == 0x04 || (Iir & 0x0E) == 0x0C) {
+            while ((JcRead(D, JcLsr) & JcLsrDataReady) != 0) {
+                UCHAR Byte = (UCHAR)JcRead(D, JcData);
+                ++D->RxBytes;
+                if (D->RxCount >= JcRxCapacity) {
+                    D->RxLost = TRUE;
+                    continue;
+                }
+                D->Rx[D->RxHead + D->RxCount >= JcRxCapacity ? D->RxHead + D->RxCount - JcRxCapacity
+                                                             : D->RxHead + D->RxCount] = Byte;
+                ++D->RxCount;
+            }
+        }
+    }
+    return Serviced;
+}
+static NTSTATUS JcEnable(WDFINTERRUPT Interrupt, WDFDEVICE Device)
+{
+    JcWrite(JcDevice(Device), JcIer, JcIerRx);
+    UNREFERENCED_PARAMETER(Interrupt);
+    return STATUS_SUCCESS;
+}
+static NTSTATUS JcDisable(WDFINTERRUPT Interrupt, WDFDEVICE Device)
+{
+    JcWrite(JcDevice(Device), JcIer, 0);
+    UNREFERENCED_PARAMETER(Interrupt);
+    return STATUS_SUCCESS;
+}
+/* ------------------------------------------------------------- power */
+static NTSTATUS JcEnterD0(WDFDEVICE Device, WDF_POWER_DEVICE_STATE Previous)
+{
+    JC_DEVICE *D = JcDevice(Device);
+    NTSTATUS Status;
+    UNREFERENCED_PARAMETER(Previous);
+    D->State = JcStateDetached;
+    D->RxHead = D->RxCount = 0;
+    D->FrameUsed = 0;
+    D->FrameUsed = 0;
+    D->FrameStart = 0xFFFFFFFF;
+    D->RxLost = FALSE;
+    D->Retries = 0;
+    D->PendingValid = FALSE;
+    D->ReportCount = D->ErrorCount = D->TimeoutCount = 0;
+    D->RxBytes = D->TxPackets = 0;
+    D->GpioReady = D->DetectLevel = 0;
+    D->ScratchOk = 0;
+    D->LastLsr = 0;
+    D->PadValid = FALSE;
+    D->ReportedState = D->ReportedCount = D->ReportedMac = ~0u;
+    D->ReportedErrors = D->ReportedTimeouts = D->ReportedRx = ~0u;
+    D->NextTrace = 0;
+    D->CalSumX = D->CalSumY = 0;
+    D->CalSamples = 0;
+    D->CalCenterX = 2048;
+    D->CalCenterY = 2048;
+    D->CalRestarts = 0;
+    D->CalRejects = 0;
+    D->CalLocked = FALSE;
+    D->CalLoX = D->CalLoY = 0x7FFF;
+    D->CalHiX = D->CalHiY = -1;
+    D->MouseCandidate = D->MouseStable = 0;
+    D->LastMouseButtons = 0;
+    D->HavePrevAxis = FALSE;
+    D->BadCrc = D->BadLen = D->AxisRejects = D->MouseRejects = 0;
+    D->RxLineErrors = 0;
+    D->LastFrameBytes = 0;
+    RtlZeroMemory(D->LastFrame, sizeof(D->LastFrame));
+    /* JcPointer=0 turns the stick/button pointer off and leaves a pure gamepad. */
+    D->PointerEnabled = JcReadParam(D, L"JcPointer", 1) ? 1u : 0u;
+    D->LastReport = KeQueryInterruptTime();
+    D->NextAction = D->NextRequest = 0;
+    Status = JcAcpiInit(Device, 1);
+    JcWriteParam(D, L"JcAcpiInit", NT_SUCCESS(Status) ? 1u : 0u);
+    JcUartInit(D);
+    JcWrite(D, JcIer, JcIerRx);
+    /* also set here: the enable callback may run earlier */
+    /* Scratch-register round trip: only a clocked, reset-released UART answers. */
+    JcWrite(D, JcScratch, 0x5A);
+    D->ScratchOk = ((JcRead(D, JcScratch) & 0xFF) == 0x5A) ? 1u : 0u;
+    JcWrite(D, JcScratch, 0);
+    D->Powered = TRUE;
+    JcReportState(D);
+    return STATUS_SUCCESS;
+}
+static NTSTATUS JcStart(WDFDEVICE Device, WDF_POWER_DEVICE_STATE Previous)
+{
+    JC_DEVICE *D = JcDevice(Device);
+    KIRQL Irql;
+    NTSTATUS Status;
+    UNREFERENCED_PARAMETER(Previous);
+    Status = JcStartHid(D);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    KeAcquireSpinLock(&D->TimerLock, &Irql);
+    D->Running = TRUE;
+    WdfTimerStart(D->Timer, WDF_REL_TIMEOUT_IN_MS(1));
+    KeReleaseSpinLock(&D->TimerLock, Irql);
+    return STATUS_SUCCESS;
+}
+static NTSTATUS JcStop(WDFDEVICE Device, WDF_POWER_DEVICE_STATE Target)
+{
+    JC_DEVICE *D = JcDevice(Device);
+    KIRQL Irql;
+    UNREFERENCED_PARAMETER(Target);
+    KeAcquireSpinLock(&D->TimerLock, &Irql);
+    D->Running = FALSE;
+    KeReleaseSpinLock(&D->TimerLock, Irql);
+    WdfTimerStop(D->Timer, TRUE);
+    JcSubmitNeutral(D);
+    return STATUS_SUCCESS;
+}
+static NTSTATUS JcExitD0(WDFDEVICE Device, WDF_POWER_DEVICE_STATE Target)
+{
+    JC_DEVICE *D = JcDevice(Device);
+    UNREFERENCED_PARAMETER(Target);
+    JcUartOff(D);
+    D->Powered = FALSE;
+    if (D->Vhf) {
+        VhfDelete(D->Vhf, TRUE);
+        D->Vhf = NULL;
+    }
+    return STATUS_SUCCESS;
+}
+/* ------------------------------------------------------------- resources */
+static NTSTATUS JcRelease(WDFDEVICE Device, WDFCMRESLIST Translated)
+{
+    JC_DEVICE *D = JcDevice(Device);
+    UNREFERENCED_PARAMETER(Translated);
+    if (D->Vhf) {
+        VhfDelete(D->Vhf, TRUE);
+        D->Vhf = NULL;
+    }
+    if (D->Gpio) {
+        WdfObjectDelete(D->Gpio);
+        D->Gpio = NULL;
+    }
+    if (D->Uart) {
+        MmUnmapIoSpace((PVOID)D->Uart, 0x40);
+        D->Uart = NULL;
+    }
+    return STATUS_SUCCESS;
+}
+static NTSTATUS JcOpenGpio(JC_DEVICE *D, LARGE_INTEGER Id)
+{
+    WCHAR Text[64];
+    UNICODE_STRING Path;
+    WDF_IO_TARGET_OPEN_PARAMS Open;
+    NTSTATUS Status;
+    RtlInitEmptyUnicodeString(&Path, Text, sizeof(Text));
+    Status = RtlUnicodeStringPrintf(&Path, L"\\Device\\RESOURCE_HUB\\%016I64x", (ULONG64)Id.QuadPart);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Status = WdfIoTargetCreate(D->Device, WDF_NO_OBJECT_ATTRIBUTES, &D->Gpio);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    WDF_IO_TARGET_OPEN_PARAMS_INIT_OPEN_BY_NAME(&Open, &Path, GENERIC_READ);
+    return WdfIoTargetOpen(D->Gpio, &Open);
+}
+static NTSTATUS JcPrepare(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST Translated)
+{
+    JC_DEVICE *D = JcDevice(Device);
+    LARGE_INTEGER Uart = {0}, Detect = {0};
+    BOOLEAN HaveUart = FALSE, HaveDetect = FALSE;
+    for (ULONG i = 0; i < WdfCmResourceListGetCount(Translated); ++i) {
+        PCM_PARTIAL_RESOURCE_DESCRIPTOR T = WdfCmResourceListGetDescriptor(Translated, i);
+        PCM_PARTIAL_RESOURCE_DESCRIPTOR R = WdfCmResourceListGetDescriptor(Raw, i);
+        if (!T || !R)
+            continue;
+        if (T->Type == CmResourceTypeInterrupt) {
+            ++D->IrqCount;
+            D->IrqVector = T->u.Interrupt.Vector;
+            D->IrqRaw = R->u.Interrupt.Vector;
+
+        } else if (T->Type == CmResourceTypeMemory && T->u.Memory.Length >= 0x40) {
+            Uart = T->u.Memory.Start;
+            HaveUart = TRUE;
+
+        } else if (T->Type == CmResourceTypeConnection && T->u.Connection.Class == CM_RESOURCE_CONNECTION_CLASS_GPIO &&
+                   T->u.Connection.Type == CM_RESOURCE_CONNECTION_TYPE_GPIO_IO) {
+            Detect.LowPart = T->u.Connection.IdLowPart;
+            Detect.HighPart = (LONG)T->u.Connection.IdHighPart;
+            HaveDetect = TRUE;
+        }
+    }
+    if (!HaveUart)
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    D->IsLeft = (Uart.QuadPart == JcLeftUartBase);
+    if (Uart.QuadPart != JcRightUartBase && Uart.QuadPart != JcLeftUartBase)
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    D->Uart = MmMapIoSpaceEx(Uart, 0x40, PAGE_READWRITE | PAGE_NOCACHE);
+    if (!D->Uart)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    if (HaveDetect && !NT_SUCCESS(JcOpenGpio(D, Detect)))
+        D->Gpio = NULL;
+    return STATUS_SUCCESS;
+}
+static VOID JcStatus(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLength, size_t InLength, ULONG Code)
+{
+    JC_DEVICE *D = JcDevice(WdfIoQueueGetDevice(Queue));
+    ULONG Values[8];
+    PVOID Buffer = NULL;
+    NTSTATUS Status;
+    UNREFERENCED_PARAMETER(InLength);
+    UNREFERENCED_PARAMETER(Code);
+    UNREFERENCED_PARAMETER(OutLength);
+    Values[0] = (ULONG)D->State;
+    Values[1] = D->ReportCount;
+    Values[2] = D->ErrorCount;
+    Values[3] = D->TimeoutCount;
+    Values[4] = (ULONG)D->Mac[0] << 24 | (ULONG)D->Mac[1] << 16 | (ULONG)D->Mac[2] << 8 | (ULONG)D->Mac[3];
+    Values[5] = (ULONG)D->ControllerType;
+    Values[6] = (ULONG)D->IsLeft;
+    Values[7] = D->PadValid ? 1u : 0u;
+    Status = WdfRequestRetrieveOutputBuffer(Request, sizeof(Values), &Buffer, NULL);
+    if (!NT_SUCCESS(Status)) {
+        WdfRequestComplete(Request, Status);
+        return;
+    }
+    RtlCopyMemory(Buffer, Values, sizeof(Values));
+    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(Values));
+}
+/* ------------------------------------------------------------- device add */
+static NTSTATUS JcAdd(WDFDRIVER Driver, PWDFDEVICE_INIT Init)
+{
+    WDF_PNPPOWER_EVENT_CALLBACKS Pnp;
+    WDF_INTERRUPT_CONFIG Irq;
+    WDF_TIMER_CONFIG Timer;
+    WDF_IO_QUEUE_CONFIG Queue;
+    WDF_OBJECT_ATTRIBUTES A;
+    WDFDEVICE Device;
+    NTSTATUS Status;
+    UNREFERENCED_PARAMETER(Driver);
+    WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&Pnp);
+    Pnp.EvtDevicePrepareHardware = JcPrepare;
+    Pnp.EvtDeviceReleaseHardware = JcRelease;
+    Pnp.EvtDeviceD0Entry = JcEnterD0;
+    Pnp.EvtDeviceD0EntryPostInterruptsEnabled = JcStart;
+    Pnp.EvtDeviceD0ExitPreInterruptsDisabled = JcStop;
+    Pnp.EvtDeviceD0Exit = JcExitD0;
+    WdfDeviceInitSetPnpPowerEventCallbacks(Init, &Pnp);
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&A, JC_DEVICE);
+    Status = WdfDeviceCreate(&Init, &A, &Device);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    JC_DEVICE *D = JcDevice(Device);
+    D->Device = Device;
+    D->ReportedState = D->ReportedCount = D->ReportedMac = ~0u;
+    KeInitializeSpinLock(&D->TimerLock);
+    WDF_INTERRUPT_CONFIG_INIT(&Irq, JcReceive, NULL);
+    Irq.EvtInterruptEnable = JcEnable;
+    Irq.EvtInterruptDisable = JcDisable;
+    Status = WdfInterruptCreate(Device, &Irq, WDF_NO_OBJECT_ATTRIBUTES, &D->Interrupt);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    WDF_TIMER_CONFIG_INIT(&Timer, JcPoll);
+    Timer.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT(&A);
+    A.ParentObject = Device;
+    A.ExecutionLevel = WdfExecutionLevelPassive;
+    Status = WdfTimerCreate(&Timer, &A, &D->Timer);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&Queue, WdfIoQueueDispatchParallel);
+    Queue.EvtIoDeviceControl = JcStatus;
+    return WdfIoQueueCreate(Device, &Queue, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
+}
+NTSTATUS DriverEntry(PDRIVER_OBJECT Object, PUNICODE_STRING Path)
+{
+    WDF_DRIVER_CONFIG C;
+    WDF_DRIVER_CONFIG_INIT(&C, JcAdd);
+    return WdfDriverCreate(Object, Path, WDF_NO_OBJECT_ATTRIBUTES, &C, WDF_NO_HANDLE);
+}
