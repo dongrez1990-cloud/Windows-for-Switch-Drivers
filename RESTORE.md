@@ -26,7 +26,7 @@
 |---|---|
 | `RESTORE.md` | 本文 |
 | `sources\` | `switchjoycon`（**手柄驱动**，含 src/tools/README/HANDOFF）、`SwitchPad`（安卓上位机）、`SwitchKey` —— **这三个项目不在任何仓库里** |
-| `packages\` | 机器上**实际安装**的已签名成品（每驱动一套 `.sys/.inf/.cat`）：switchwifi **0.7.4**、switchwifi 0.7.2、rollback（0.7.0.0 二进制）、**switchjoycon 0.3.20**、tegra210sdhc 0.4.0.1、switchfan、switchaudio |
+| `packages\` | **17 套已签名成品**（每套 `.sys/.inf/.cat`），版本与机器实际安装的逐一核对一致：<br>switchwifi **0.7.4** / 0.7.2 / 回退包(0.7.0.0 二进制) · switchjoycon **0.3.20**<br>switchbt 1.0.0.19 · switchfan 1.0.0.22 · switchaudio 1.0.0.17 · switchbattery 1.0.0.11<br>switchpwrbtn 1.0.0.4 · switchrtc 1.0.0.2 · switchsio 0.2.3.0 · switchsensor 1.0.0.1<br>switchtouch 1.0.0.4 · tegra210gpio 1.0.0.4 · tegra210i2c 1.0.0.5 · tegra210sdhc 0.4.0.1 | 不重新编译也能把整台机器装回来 |
 | `patches\` | `0001-UEFI-WinX-Erista-...patch` —— UEFI 那 16 个文件的完整补丁（`git am` 可直接应用） |
 | `esp\` | 引导配置：`startup.nsh`、`bootloader\hekate_ipl.ini`、`bootloader\ini\*.ini`（各启动项）<br>`MANIFEST-binaries-sha256.txt`：44 个引导二进制的哈希清单（**只记哈希不装文件**，重新获取后可比对） |
 | `docs\` | 交接文档、0.7.3/0.7.4 报告、基线清单、上机日志、故障记录、**实测驱动版本清单** |
