@@ -133,6 +133,19 @@ $manifestSd = [ordered]@{
   loaderNoCid = [ordered]@{ file = 'Switch-Sd/SDLOADAA64-NOCID.EFI'; sha256 = (Sha256 (Join-Path $sdKit 'SDLOADAA64-NOCID.EFI')) }
 }
 
+# Wi-Fi (Switch-Wifi): a NetAdapterCx/WiFiCx client, so it cannot use the generic
+# build path above -- it needs the 10.0.26100 headers, KMDF 1.33 and the class
+# extension stub libraries. Staged like nvtsdhc: shipped in the zip, not offered
+# for live install by the control center, because the ACPI device only exists
+# when the UEFI Wi-Fi handoff ran and the board files are the user's own.
+Write-Host '=== switchwifi'
+& (Join-Path $Root 'tools\Build-SwitchWifi.ps1') -OutDir (Join-Path $Root 'build\SwitchWifi') | Out-Host
+$wifiBuild = Join-Path $Root 'build\SwitchWifi'
+$wifiKit = Join-Path $DriverStage 'Switch-Wifi'
+New-Item -ItemType Directory -Force $wifiKit | Out-Null
+Copy-Item (Join-Path $Root 'kits\Switch-Wifi\*') $wifiKit -Recurse
+foreach ($ext in 'sys', 'cat', 'inf') { Copy-Item (Join-Path $wifiBuild "switchwifi.$ext") $wifiKit }
+
 Copy-Item (Join-Path $Root 'tools\cert\SwitchWOA-Test.cer') $DriverStage
 $driversZip = Join-Path $Out "SwitchDrivers-$Version.zip"
 Compress-Archive -Path (Join-Path $DriverStage '*') -DestinationPath $driversZip -CompressionLevel Optimal

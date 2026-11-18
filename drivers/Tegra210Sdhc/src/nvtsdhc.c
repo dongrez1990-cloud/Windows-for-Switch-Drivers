@@ -334,6 +334,9 @@ static NV_DIAG NvDiag = { .LastErrorCommand = 0xFF };
 #if NV_T214_SDR104
 #include "t214_sdmmc.h"
 #endif
+#if NV_T210_UHS
+#include "t210_uhs.h"
+#endif
 #if NV_T214_DDR200
 #include "t214_ddr200.h"
 
@@ -450,15 +453,98 @@ NvDiagSetValue(
 static WORK_QUEUE_ITEM NvDiagSaveItem;
 static volatile LONG NvDiagSaveQueued;
 static volatile LONG64 NvDiagNextPeriodicSave;
-static struct { PCWSTR Name; ULONG Value; } NvDiagSnapshot[64];
+static struct { PCWSTR Name; ULONG Value; } NvDiagSnapshot[160];
 static ULONG NvDiagSnapshotCount;
 
 static VOID NvDiagCapture(PCWSTR Name, ULONG Value)
 {
     NT_ASSERT(NvDiagSnapshotCount < RTL_NUMBER_OF(NvDiagSnapshot));
+    /* Never write past the array: an out-of-bounds write here corrupts the
+       neighbouring globals and produced 0x7B INACCESSIBLE_BOOT_DEVICE on
+       2026-11-12.  Release builds have no assert, so clamp explicitly. */
+    if (NvDiagSnapshotCount >= RTL_NUMBER_OF(NvDiagSnapshot)) return;
     NvDiagSnapshot[NvDiagSnapshotCount].Name = Name;
     NvDiagSnapshot[NvDiagSnapshotCount++].Value = Value;
 }
+
+/* P0 for the T210 (Erista) UHS/DDR200 work: a read-only snapshot of the
+ * registers that decide whether SDR104/DDR200 can be attempted at all.
+ * Nothing here writes: no voltage switch, no clock change, no tuning.
+ * The values answer three open questions (see DDR200-T210-濠电偞鎸搁幊搴＄暦?md):
+ *   1. does this SDHCI have the vendor pad-calibration block (0x1e0/0x1e4/0x1ec)
+ *      and the DDR200 tap field (0x100[23:16])?
+ *   2. is PLLC4 (CAR 0x5a4) at the 998.4 MHz the T214 divider maths needs?
+ *   3. are the PMC IO pad and the APB_MISC SDMMC1 pads where T214Signaling()
+ *      expects them?
+ */
+#ifndef NV_UHS_PROBE
+#define NV_UHS_PROBE 1
+#endif
+
+#if NV_UHS_PROBE
+static VOID
+NvUhsProbe(
+    _In_ PSDHC_EXTENSION SdhcExtension
+    )
+{
+    static volatile LONG Done;
+    PHYSICAL_ADDRESS Pa;
+    PULONG Car, Pmc, Misc, MiscPad;
+
+    if (InterlockedCompareExchange(&Done, 1, 0) != 0) {
+        return;
+    }
+
+    NvDiagCapture(L"UhsCaps", SdhcReadRegisterUlong(SdhcExtension, SDHC_CAPABILITIES));
+    NvDiagCapture(L"UhsCaps2", SdhcReadRegisterUlong(SdhcExtension, SDHC_CAPABILITIES2));
+    NvDiagCapture(L"UhsHc2", SdhcReadRegisterUshort(SdhcExtension, SDHC_HOST_CONTROL2));
+    NvDiagCapture(L"UhsHost100", SdhcReadRegisterUlong(SdhcExtension, 0x100));
+    NvDiagCapture(L"UhsHost10c", SdhcReadRegisterUlong(SdhcExtension, 0x10c));
+    NvDiagCapture(L"UhsHost1c0", SdhcReadRegisterUlong(SdhcExtension, 0x1c0));
+    NvDiagCapture(L"UhsHost1c4", SdhcReadRegisterUlong(SdhcExtension, 0x1c4));
+    NvDiagCapture(L"UhsHost1e0", SdhcReadRegisterUlong(SdhcExtension, 0x1e0));
+    NvDiagCapture(L"UhsHost1e4", SdhcReadRegisterUlong(SdhcExtension, 0x1e4));
+    NvDiagCapture(L"UhsHost1ec", SdhcReadRegisterUlong(SdhcExtension, 0x1ec));
+    NvDiagCapture(L"UhsHost30", SdhcReadRegisterUlong(SdhcExtension, 0x30));
+    NvDiagCapture(L"UhsHost34", SdhcReadRegisterUlong(SdhcExtension, 0x34));
+    NvDiagCapture(L"UhsHost38", SdhcReadRegisterUlong(SdhcExtension, 0x38));
+
+    Pa.QuadPart = NV_T210_CAR_BASE;
+    Car = (PULONG) MmMapIoSpaceEx(Pa, PAGE_SIZE, PAGE_READONLY | PAGE_NOCACHE);
+    if (Car != NULL) {
+        NvDiagCapture(L"UhsCar150", Car[NV_T210_CLK_SOURCE_SDMMC1 / 4]);
+        NvDiagCapture(L"UhsCar55c", Car[0x55c / 4]);
+        NvDiagCapture(L"UhsPllc4", Car[0x5a4 / 4]);
+        NvDiagCapture(L"UhsPllc4Ctl", Car[0x5a8 / 4]);
+        MmUnmapIoSpace(Car, PAGE_SIZE);
+    }
+
+    Pa.QuadPart = 0x7000E000;
+    Pmc = (PULONG) MmMapIoSpaceEx(Pa, PAGE_SIZE, PAGE_READONLY | PAGE_NOCACHE);
+    if (Pmc != NULL) {
+        NvDiagCapture(L"UhsPmcStatus", Pmc[0x438 / 4]);
+        NvDiagCapture(L"UhsPmc444", Pmc[0x844 / 4]);
+        NvDiagCapture(L"UhsPmc4e4", Pmc[0x8e4 / 4]);
+        MmUnmapIoSpace(Pmc, PAGE_SIZE);
+    }
+
+    Pa.QuadPart = 0x70000000;
+    Misc = (PULONG) MmMapIoSpaceEx(Pa, PAGE_SIZE, PAGE_READONLY | PAGE_NOCACHE);
+    if (Misc != NULL) {
+        NvDiagCapture(L"UhsMiscA98", Misc[0xa98 / 4]);
+        MmUnmapIoSpace(Misc, PAGE_SIZE);
+    }
+
+    Pa.QuadPart = 0x70003000;
+    MiscPad = (PULONG) MmMapIoSpaceEx(Pa, PAGE_SIZE, PAGE_READONLY | PAGE_NOCACHE);
+    if (MiscPad != NULL) {
+        NvDiagCapture(L"UhsPad3000", MiscPad[0]);
+        NvDiagCapture(L"UhsPad3004", MiscPad[0x04 / 4]);
+        NvDiagCapture(L"UhsPad3014", MiscPad[0x14 / 4]);
+        MmUnmapIoSpace(MiscPad, PAGE_SIZE);
+    }
+}
+#endif
 
 static VOID
 NvDiagSaveWorker(
@@ -500,6 +586,9 @@ NvDiagSaveClock(
     InterlockedExchange64(&NvDiagNextPeriodicSave,
                           (LONG64)KeQueryInterruptTime() + 300000000LL);
     NvDiagSnapshotCount = 0;
+#if NV_UHS_PROBE
+    NvUhsProbe(SdhcExtension);
+#endif
 #if NV_T214_SDR104
     NvDiagCapture( L"Sdr104Build", 1);
     NvDiagCapture( L"AdmaAvailable", SdhcExtension->T214Bounce != NULL);
@@ -655,6 +744,27 @@ NvDiagThread(
 // SlotExtension routines.
 //-----------------------------------------------------------------------------
 
+#if NV_T210_UHS
+/* Compile-time gating only. This driver owns the boot disk, and querying the
+   registry during DriverEntry / SdhcInitialize can deadlock the storage stack
+   that is being initialised (observed twice as 0x7B INACCESSIBLE_BOOT_DEVICE
+   on 2026-11-12). NV_T210_UHS_ACTIVE=1 turns the hardware path on. */
+static ULONG T210Switch1V8, T210SwitchSdr104, T210SwitchMux;
+
+static VOID T210LoadSwitches(VOID)
+{
+#ifdef NV_T210_UHS_ACTIVE
+    T210Switch1V8 = 1;
+    T210SwitchSdr104 = 1;
+    T210SwitchMux = 3;
+#else
+    T210Switch1V8 = 0;
+    T210SwitchSdr104 = 0;
+    T210SwitchMux = 0;
+#endif
+}
+#endif
+
 NTSTATUS
 DriverEntry(
     _In_ PVOID DriverObject,
@@ -683,6 +793,9 @@ Return Value:
 
     // Keep absolute callback addresses in the image so the ARM64 loader can
     // relocate the miniport even when the optional diagnostics are disabled.
+#if NV_T210_UHS
+    T210LoadSwitches();
+#endif
     static SDPORT_INITIALIZATION_DATA InitializationData = {
         .StructureSize = sizeof(InitializationData),
         .GetSlotCount = SdhcGetSlotCount,
@@ -934,6 +1047,24 @@ Return value:
 #if NV_T214_SDR104
     if (CrashdumpMode && KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_NOT_SUPPORTED;
 #endif
+#if NV_T210_UHS
+    /* T210 (Erista) UHS-I. The switches were read in DriverEntry (PASSIVE);
+       this callback may run at DISPATCH_LEVEL, so nothing here touches the
+       registry. Everything stays inert unless Parameters\Uhs1V8 is 1. */
+    SdhcExtension->T210UhsMux = T210SwitchMux;
+    SdhcExtension->T210Sdr104 = T210SwitchSdr104 != 0;
+    SdhcExtension->T210Enabled = (T210Switch1V8 != 0) || SdhcExtension->T210Sdr104;
+    if (SdhcExtension->T210Enabled) {
+        NTSTATUS uhs = T210UhsInit(SdhcExtension);
+        if (!NT_SUCCESS(uhs)) {
+            SdhcExtension->T210Enabled = FALSE;
+            SdhcExtension->T210Sdr104 = FALSE;
+        }
+        SdhcExtension->T210InitStatus = (ULONG)uhs;
+    }
+    NvDiagCapture(L"UhsFlags", (SdhcExtension->T210Enabled ? 1u : 0u) | (SdhcExtension->T210Sdr104 ? 2u : 0u));
+    NvDiagCapture(L"UhsMuxValue", SdhcExtension->T210UhsMux);
+#endif
 
     //
     // Initialize host capabilities.
@@ -1020,6 +1151,19 @@ Return value:
 
     if (CarSet) {
         Capabilities->BaseClockFrequencyKhz = NV_T210_SDMMC1_CAR_KHZ;
+#if NV_T210_UHS
+    /* Declare UHS-I only when Parameters\Uhs1V8 (or UhsSdr104) is set: SDPORT
+       then drives the whole sequence itself (signalling, speed, tuning). */
+    if (SdhcExtension->T210Enabled) {
+        Capabilities->Supported.HighSpeed = 1;
+        Capabilities->Supported.SignalingVoltage18V = 1;
+        Capabilities->Supported.SDR50 = 0;
+        Capabilities->Supported.DDR50 = 0;
+        if (SdhcExtension->T210Sdr104) Capabilities->Supported.SDR104 = 1;
+        if (SdhcExtension->T210BaseKhz) Capabilities->BaseClockFrequencyKhz = SdhcExtension->T210BaseKhz + 2000;
+
+    }
+#endif
     }
 #endif
 
@@ -2574,6 +2718,24 @@ Return value:
     case SdBusSpeedHS400:
         UhsMode = SdhcGetHwUhsMode(Speed);
         Status = SdhcSetUhsMode(SdhcExtension, UhsMode);
+#if NV_T210_UHS
+        if (NT_SUCCESS(Status) && Speed == SdBusSpeedSDR104 &&
+            SdhcExtension->T210Enabled && SdhcExtension->T210Sdr104) {
+            /* T210 (Erista): SDR104 needs the fast parent clock and a tuning
+               pass. Any failure drops back to 3.3 V high speed, which is the
+               only mode this console is known to run. */
+            NTSTATUS uhs = T210ClockSdr104(SdhcExtension);
+            NvDiagCapture(L"UhsClockStatus", (ULONG)uhs);
+            if (NT_SUCCESS(uhs)) uhs = T210Tune(SdhcExtension);
+            NvDiagCapture(L"UhsTuneStatus2", (ULONG)uhs);
+            NvDiagCapture(L"UhsBaseKhz", SdhcExtension->T210BaseKhz);
+            NvDiagCapture(L"UhsTap", SdhcExtension->T210Tap);
+            if (!NT_SUCCESS(uhs)) {
+                (VOID)T210Power3V3(SdhcExtension);
+                Status = uhs;
+            }
+        }
+#endif
         break;
 
     default:
@@ -2729,6 +2891,15 @@ Return value:
     NvDiagSaveClock(SdhcExtension);
 #endif
     return t214Status;
+#endif
+#if NV_T210_UHS
+    if (SdhcExtension->T210Enabled) {
+        NTSTATUS t210Status = T210Signaling(SdhcExtension, Enable);
+#if NV_DIAG_CLOCK
+        NvDiagSaveClock(SdhcExtension);
+#endif
+        return t210Status;
+    }
 #endif
     if (NV_T210_LITE_SLOT && Enable) {
         return STATUS_NOT_SUPPORTED;

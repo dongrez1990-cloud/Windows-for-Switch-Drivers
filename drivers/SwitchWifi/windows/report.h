@@ -34,6 +34,10 @@ typedef struct SWIFI_REPORT_DATA {
     ULONG FilterFlags, FilterCount, FilterMode, IrqSeen, RingSeen;
     NTSTATUS FilterStatus;
     ULONG Count[SwifiRxCases];
+    ULONG EapolFrames, KeyAdds, KeyFails;
+    NTSTATUS KeyStatus;
+    ULONG DownEvents, LastDownType, KeyPair, KeyGroup;
+    ULONG EvSeen, EvDropped, EvTypeMask;
 } SWIFI_REPORT_DATA;
 
 typedef struct SWIFI_REPORT {
@@ -53,6 +57,24 @@ VOID SwifiReportSelection(SWIFI_REPORT *R, const SWIFI_JOIN_SELECTION *Selection
 VOID SwifiReportJoin(SWIFI_REPORT *R, NTSTATUS Status);
 VOID SwifiReportFilter(SWIFI_REPORT *R, ULONG Flags, ULONG Count, ULONG Mode, NTSTATUS Status);
 VOID SwifiReportKeys(SWIFI_REPORT *R, ULONG Mask, ULONG Adds, ULONG Removes);
+VOID SwifiReportEapol(SWIFI_REPORT *R);
+VOID SwifiReportKeyAttempt(SWIFI_REPORT *R);
+VOID SwifiReportKeyStatus(SWIFI_REPORT *R, NTSTATUS Status);
+VOID SwifiReportDown(SWIFI_REPORT *R, ULONG Type);
+VOID SwifiReportKeyKind(SWIFI_REPORT *R, BOOLEAN Group);
+VOID SwifiReportEvent(SWIFI_REPORT *R, BOOLEAN Dropped, ULONG Type);
+VOID SwifiReportEapol(SWIFI_REPORT *R);
+VOID SwifiReportKeyAttempt(SWIFI_REPORT *R);
+VOID SwifiReportKeyStatus(SWIFI_REPORT *R, NTSTATUS Status);
+VOID SwifiReportDown(SWIFI_REPORT *R, ULONG Type);
+VOID SwifiReportKeyKind(SWIFI_REPORT *R, BOOLEAN Group);
+VOID SwifiReportEvent(SWIFI_REPORT *R, BOOLEAN Dropped, ULONG Type);
+VOID SwifiReportEapol(SWIFI_REPORT *R);
+VOID SwifiReportKeyAttempt(SWIFI_REPORT *R);
+VOID SwifiReportKeyStatus(SWIFI_REPORT *R, NTSTATUS Status);
+VOID SwifiReportDown(SWIFI_REPORT *R, ULONG Type);
+VOID SwifiReportKeyKind(SWIFI_REPORT *R, BOOLEAN Group);
+VOID SwifiReportEvent(SWIFI_REPORT *R, BOOLEAN Dropped, ULONG Type);
 VOID SwifiReportRx(SWIFI_REPORT *R, SWIFI_RX_CASE Case);
 VOID SwifiReportFlush(SWIFI_REPORT *R);
 

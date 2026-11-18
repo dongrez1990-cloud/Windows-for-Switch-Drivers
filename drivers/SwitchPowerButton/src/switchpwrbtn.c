@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Nintendo Switch power button driver, KMDF + Virtual HID Framework (VHF).
  *
  * ACPI device PWRB (ACPI\SWOA0601):
@@ -25,7 +25,26 @@
 #define ONOFFSTAT_EN0        0x04
 #define ONOFFIRQ_EN0_F       0x04
 #define ONOFFIRQ_EN0_R       0x08
+/* ONOFF_CFG1 (0x41) bit 1 = PWR_OFF, from NintendoSwitchPkg
+ * Include/Device/Max77620.h (MAX77620_ONOFFCNFG1_PWR_OFF). That bit is the
+ * PMIC's software power-off; ONOFF_CFG2 only carries alarm/RST wake sources. */
+#define MAX77620_ONOFFCNFG1     0x41
+#define ONOFFCNFG1_PWR_OFF      0x02
+#define MAX77620_SD3_VOLT       0x19
+#define MAX77620_SD3_CFG        0x20
+#define MAX77620_SD_CFG2        0x22
+#define MAX77620_LDO1_CFG       0x25
+#define MAX77620_LDO2_CFG       0x27
+#define MAX77620_LDO6_CFG       0x2F
+#define MAX77620_LDO7_CFG       0x31
+#define MAX77620_FPS_SD3        0x52
+#define SD_CFG_ENABLE           0x08u   /* bit3, as in the proven LDO1 sequence */
+#define SD_CFG2_POK             0x08u   /* bit3 of SD3_CFG2 = rail power good */
+#define MAX77620_GLBL1          0x00
+#define MAX77620_AME_GPIO       0x40
 #define POLL_MS              50
+#define HOLD_REBOOT_MS       3000
+#define HOLD_REBOOT_POLLS    (HOLD_REBOOT_MS / POLL_MS)
 #define REPORT_ID_SYSTEM     1
 
 /* System Control: Power Down (0x81), Wake Up (0x83), six padding bits. */
@@ -53,6 +72,11 @@ typedef struct _SWPWR_DEVICE {
     LONG Presses;
     LONG Reports;
     LONG WakeReports, PowerReports;
+    ULONG HoldPolls;            /* consecutive polls with EN0 held */
+    BOOLEAN HoldFired;
+    LONG Rebooting;
+    LONG PmicOff;
+    ULONG LastPowerAction;
 } SWPWR_DEVICE, *PSWPWR_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(SWPWR_DEVICE, SwPwrGetDevice)
 
@@ -69,6 +93,8 @@ EVT_WDF_DEVICE_SELF_MANAGED_IO_CLEANUP SwPwrEvtSelfManagedIoCleanup;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_SUSPEND SwPwrEvtSuspend;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_RESTART SwPwrEvtRestart;
 EVT_WDF_TIMER SwPwrEvtTimer;
+EVT_WDF_DEVICE_D0_EXIT SwPwrEvtD0Exit;
+EVT_WDF_DEVICE_SELF_MANAGED_IO_FLUSH SwPwrEvtFlush;
 
 static WCHAR SwPwrParamsPath[256];
 static const GUID SwPwrDisplayGuid =
@@ -142,6 +168,116 @@ static NTSTATUS SwPwrReadReg(WDFIOTARGET Target, UCHAR Register, PUCHAR Value)
 
 /* ---------------------------------------------------------------- button */
 
+/* 5.0.0: the console cannot power off through ACPI (the DSDT has no _S5), so
+ * "shut down" in Windows only halts the SoC and the rails stay on. At the very
+ * end of a clean shutdown (SelfManagedIoFlush, after the volumes were flushed)
+ * the PMIC is told to switch itself off, which is exactly what the hardware
+ * long-press would do, only with the data already on the card.
+ * Also: holding the button for HOLD_REBOOT_MS performs an orderly restart, so
+ * the console comes back through hekate instead of being hard-cut by the PMIC. */
+
+/* ntshutdown: SHUTDOWN_ACTION 0 = shutdown, 1 = reboot. Declared here because
+ * the public WDK headers do not expose it; ntoskrnl exports it. */
+NTSTATUS NtShutdownSystem(ULONG Action);
+
+static BOOLEAN SwPwrParamEnabled(PCWSTR Name, BOOLEAN Default)
+{
+    RTL_QUERY_REGISTRY_TABLE Table[2];
+    ULONG Value = Default ? 1 : 0;
+
+    if (SwPwrParamsPath[0] == L'\0') return Default;
+    RtlZeroMemory(Table, sizeof(Table));
+    Table[0].Flags = RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK;
+    Table[0].Name = (PWSTR)Name;
+    Table[0].EntryContext = &Value;
+    Table[0].DefaultType = (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_NONE;
+    if (!NT_SUCCESS(RtlQueryRegistryValues(RTL_REGISTRY_ABSOLUTE, SwPwrParamsPath, Table, NULL, NULL))) {
+        return Default;
+    }
+    return Value != 0;
+}
+
+static NTSTATUS SwPwrWriteReg(WDFIOTARGET Target, UCHAR Register, UCHAR Value)
+{
+    UCHAR Buffer[2] = {Register, Value};
+    WDF_MEMORY_DESCRIPTOR Memory;
+    WDF_REQUEST_SEND_OPTIONS Options;
+    ULONG_PTR Bytes = 0;
+    NTSTATUS Status;
+
+    if (Target == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&Memory, Buffer, sizeof(Buffer));
+    WDF_REQUEST_SEND_OPTIONS_INIT(&Options, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    Options.Timeout = WDF_REL_TIMEOUT_IN_MS(200);
+    Status = WdfIoTargetSendWriteSynchronously(Target, NULL, &Memory, NULL, &Options, &Bytes);
+    if (NT_SUCCESS(Status) && Bytes != sizeof(Buffer)) {
+        Status = STATUS_DEVICE_PROTOCOL_ERROR;
+    }
+    return Status;
+}
+
+/* PMIC power-off: ONOFF_CFG1 bit 1 (PWR_OFF), written twice like the vendor
+ * power-off helper does. Registry Parameters\PowerOffPmic = 0 disables it. */
+static VOID SwPwrPmicOff(PSWPWR_DEVICE Dev)
+{
+    UCHAR Value = 0;
+    NTSTATUS Status;
+
+    if (Dev == NULL || Dev->I2c == NULL) return;
+    if (!SwPwrParamEnabled(L"PowerOffPmic", TRUE)) {
+        SwPwrTrace(L"PmicOffSkipped", 1);
+        return;
+    }
+    Status = SwPwrReadReg(Dev->I2c, MAX77620_ONOFFCNFG1, &Value);
+    SwPwrTrace(L"PmicOffRead", NT_SUCCESS(Status) ? Value : (0xFFFF0000u | (ULONG)Status));
+    Value = (UCHAR)(Value | ONOFFCNFG1_PWR_OFF);
+    Status = SwPwrWriteReg(Dev->I2c, MAX77620_ONOFFCNFG1, Value);
+    if (NT_SUCCESS(Status)) {
+        Status = SwPwrWriteReg(Dev->I2c, MAX77620_ONOFFCNFG1, Value);
+    }
+    SwPwrTrace(L"PmicOffStatus", (ULONG)Status);
+    if (NT_SUCCESS(Status)) {
+        SwPwrTrace(L"PmicOff", (ULONG)InterlockedIncrement(&Dev->PmicOff));
+    }
+}
+
+/* Audio bring-up aid: the Realtek codec's AVDD/DBVDD come from MAX77620 SD3
+ * (L4T: sound { dbvdd/avdd = <&max77620_sd3> }). If those rails are down the
+ * codec still answers I2C while every output is silent, which is exactly the
+ * symptom we are chasing, so record the rails once at device start. */
+static VOID SwPwrPmicDump(PSWPWR_DEVICE Dev)
+{
+    static const struct { PCWSTR Name; UCHAR Reg; } Map[] = {
+        {L"PmicGlbl1", MAX77620_GLBL1},
+        {L"PmicSd3Volt", MAX77620_SD3_VOLT},
+        {L"PmicSd3Cfg", MAX77620_SD3_CFG},
+        {L"PmicSdCfg2", MAX77620_SD_CFG2},
+        {L"PmicFpsSd3", MAX77620_FPS_SD3},
+        {L"PmicLdo1Cfg", MAX77620_LDO1_CFG},
+        {L"PmicLdo2Cfg", MAX77620_LDO2_CFG},
+        {L"PmicLdo6Cfg", MAX77620_LDO6_CFG},
+        {L"PmicLdo7Cfg", MAX77620_LDO7_CFG},
+        {L"PmicOnOffCfg1", MAX77620_ONOFFCNFG1},
+        {L"PmicAmeGpio", MAX77620_AME_GPIO},
+    };
+    ULONG Index;
+
+    for (Index = 0; Index < RTL_NUMBER_OF(Map); ++Index) {
+        UCHAR Value = 0;
+        NTSTATUS Status = SwPwrReadReg(Dev->I2c, Map[Index].Reg, &Value);
+        SwPwrTrace(Map[Index].Name, NT_SUCCESS(Status) ? Value : (0xFFFF0000u | (ULONG)Status));
+    }
+}
+
+static VOID SwPwrReboot(PSWPWR_DEVICE Dev)
+{
+    if (InterlockedCompareExchange(&Dev->Rebooting, 1, 0) != 0) return;
+    SwPwrTrace(L"HoldReboot", 1);
+    SwPwrTrace(L"RebootCall", (ULONG)NtShutdownSystem(1));   /* 1 = restart */
+}
+
 static VOID SwPwrReport(PSWPWR_DEVICE Dev, UCHAR Buttons)
 {
     HID_XFER_PACKET Packet;
@@ -178,6 +314,15 @@ VOID SwPwrEvtTimer(WDFTIMER Timer)
     if (NT_SUCCESS(Status)) {
         Dev->Failures = 0;
         Held = (Stat & ONOFFSTAT_EN0) != 0;
+        /* A 3 s hold restarts through the OS path, which flushes the volumes
+           first. The PMIC's own ~8 s hard cut stays as the last resort. */
+        if (Held && !Dev->Button.suppress_held) {
+            if (++Dev->HoldPolls == HOLD_REBOOT_POLLS) {
+                SwPwrReboot(Dev);
+            }
+        } else {
+            Dev->HoldPolls = 0;
+        }
         struct swpwr_button_event Event=swpwr_button_update(&Dev->Button,Held,
             (Irq&ONOFFIRQ_EN0_R)!=0,InterlockedCompareExchange(&Dev->DisplayOff,0,0)!=0);
         if (Event.emit) {
@@ -247,6 +392,7 @@ NTSTATUS SwPwrEvtSelfManagedIoInit(WDFDEVICE Device)
     SwPwrTrace(L"OnOffStatAtStart", Stat);
     SwPwrTrace(L"OnOffIrqAtStart", Irq);
     Dev->Button.suppress_held = (Stat & ONOFFSTAT_EN0) != 0;
+    SwPwrPmicDump(Dev);
 
     if (Dev->Vhf == NULL) {
         VHF_CONFIG_INIT(&Config, WdfDeviceWdmGetDeviceObject(Device), sizeof(SwPwrReportDescriptor),
@@ -294,9 +440,33 @@ NTSTATUS SwPwrEvtSelfManagedIoInit(WDFDEVICE Device)
     return SwPwrEvtRestart(Device);
 }
 
-NTSTATUS SwPwrEvtSuspend(WDFDEVICE Device)
+/* The system power action is only valid while the transition runs, so record it
+   in D0Exit and reuse it during the shutdown flush. */
+NTSTATUS SwPwrEvtD0Exit(WDFDEVICE Device, WDF_POWER_DEVICE_STATE TargetState)
 {
-    PSWPWR_DEVICE Dev=SwPwrGetDevice(Device);
+    PSWPWR_DEVICE Dev = SwPwrGetDevice(Device);
+    UNREFERENCED_PARAMETER(TargetState);
+    Dev->LastPowerAction = (ULONG)WdfDeviceGetSystemPowerAction(Device);
+    SwPwrTrace(L"PowerAction", Dev->LastPowerAction);
+    return STATUS_SUCCESS;
+}
+
+/* KMDF calls this once the volumes have been flushed, before the console is
+   halted. A real power-down cuts the PMIC here; a restart leaves it alone. */
+VOID SwPwrEvtFlush(WDFDEVICE Device)
+{
+    PSWPWR_DEVICE Dev = SwPwrGetDevice(Device);
+    ULONG Action = Dev->LastPowerAction;
+
+    if (Action == 0) Action = (ULONG)WdfDeviceGetSystemPowerAction(Device);
+    SwPwrTrace(L"FlushAction", Action);
+    if (Action == (ULONG)PowerActionShutdown || Action == (ULONG)PowerActionShutdownOff) {
+        SwPwrPmicOff(Dev);
+    }
+}
+
+NTSTATUS SwPwrEvtSuspend(WDFDEVICE Device)
+{    PSWPWR_DEVICE Dev=SwPwrGetDevice(Device);
     KIRQL Irql;
     KeAcquireSpinLock(&Dev->TimerLock,&Irql);
     Dev->Stopping=TRUE;
@@ -359,6 +529,8 @@ NTSTATUS SwPwrEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     Pnp.EvtDeviceSelfManagedIoCleanup = SwPwrEvtSelfManagedIoCleanup;
     Pnp.EvtDeviceSelfManagedIoSuspend = SwPwrEvtSuspend;
     Pnp.EvtDeviceSelfManagedIoRestart = SwPwrEvtRestart;
+    Pnp.EvtDeviceSelfManagedIoFlush = SwPwrEvtFlush;
+    Pnp.EvtDeviceD0Exit = SwPwrEvtD0Exit;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &Pnp);
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attributes, SWPWR_DEVICE);
     Status=WdfDeviceCreate(&DeviceInit,&Attributes,&Device);
@@ -379,7 +551,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwPwrParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwPwrParamsPath);
     }
-    SwPwrTrace(L"DriverVersion", 4);
+    SwPwrTrace(L"DriverVersion", 9);
     WDF_DRIVER_CONFIG_INIT(&Config, SwPwrEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }

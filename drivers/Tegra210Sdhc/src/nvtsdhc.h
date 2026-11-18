@@ -1,8 +1,13 @@
-#ifndef NV_T214_SDR104
+﻿#ifndef NV_T214_SDR104
 #define NV_T214_SDR104 0
 #endif
 #ifndef NV_T214_DDR200
 #define NV_T214_DDR200 0
+#endif
+
+/* T210 (Erista) UHS-I/SDR104 bring-up, see src/t210_uhs.h. Off by default. */
+#ifndef NV_T210_UHS
+#define NV_T210_UHS 0
 #endif
 #if NV_T214_DDR200 && !NV_T214_SDR104
 #error "DDR200 requires the T214 SDR104 recovery path."
@@ -1425,6 +1430,16 @@ typedef struct _SDHC_EXTENSION {
     BOOLEAN AppPrefixAccepted;
 #endif
       
+#if NV_T210_UHS
+    /* T210 (Erista) UHS-I state, see src/t210_uhs.h. */
+    PUCHAR T210Car, T210Misc, T210Pmc, T210I2c, T210Gpio;
+    PKEVENT T210Gate;
+    HANDLE T210GateHandle;
+    BOOLEAN T210Ready, T210Voltage18, T210Tuned, T210Enabled, T210Sdr104;
+    ULONG T210Ldo2Value, T210VoltageStatus, T210VoltageFailures, T210InitStatus;
+    ULONG T210TuneStatus, T210TuneIterations, T210Tap, T210UhsMux;
+    ULONG T210PllBefore, T210PllAfter, T210CarSource, T210BaseKhz;
+#endif
 } SDHC_EXTENSION, *PSDHC_EXTENSION;
 
 // ---------------------------------------------------------------------------

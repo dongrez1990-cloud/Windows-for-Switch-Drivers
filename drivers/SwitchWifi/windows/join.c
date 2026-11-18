@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include "join.h"
 #include "join_firmware.h"
+static NTSTATUS BeginLeave(SWIFI_JOIN *J, USHORT Reason, NTSTATUS ConnectStatus, BOOLEAN TryNext);
+static VOID Down(SWIFI_JOIN *J, WDI_ASSOC_STATUS Reason);
 #include "station_keys.h"
 #include "station_filter.h"
 
@@ -8,7 +10,7 @@ typedef struct JOIN_CANDIDATE {
     LIST_ENTRY Link;
     swifi_bss_profile Profile;
     UCHAR Peer[6], Channel, Pmkid[16];
-    BOOLEAN HavePmkid, ExcludeUnencrypted, Reported;
+    BOOLEAN HavePmkid, ExcludeUnencrypted, Reported, Retried;
     ULONG AllowedPhys;
     WDI_PHY_TYPE Phy;
     USHORT BeaconLength, VendorLength, VendorAdded, VendorRemoved;
@@ -36,6 +38,7 @@ struct SWIFI_JOIN {
     BOOLEAN ResetNotice;
     ULONG DisallowedBands;
     BOOLEAN Online, Poisoned, Associated, Leaving, Announced, RetryNext;
+    BOOLEAN FirmwareDirty;
     JOIN_TASK Connect, Leave;
     LIST_ENTRY Pending;
     JOIN_CANDIDATE *Active;
@@ -44,12 +47,16 @@ struct SWIFI_JOIN {
     ULONG TxKbps, RxKbps, IndicatedTx, IndicatedRx;
     LONG IndicatedQuality;
     WDFWORKITEM LinkWorker;
+    WDFTIMER LinkTimer;
 };
 typedef struct LINK_WORK { SWIFI_JOIN *Join; } LINK_WORK;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(LINK_WORK, LinkWorkContext);
 typedef struct JOIN_TIMER_CONTEXT { SWIFI_JOIN *Join; } JOIN_TIMER_CONTEXT;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(JOIN_TIMER_CONTEXT, JoinTimerContext);
+typedef struct LINK_TIMER_CONTEXT { SWIFI_JOIN *Join; } LINK_TIMER_CONTEXT;
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(LINK_TIMER_CONTEXT, LinkTimerContext);
 static EVT_WDF_TIMER JoinTimeout;
+static EVT_WDF_TIMER LinkTick;
 
 static VOID DropPending(SWIFI_JOIN *J)
 {
@@ -203,12 +210,67 @@ static VOID MediaState(SWIFI_JOIN *J, BOOLEAN Connected)
     WdfObjectDereference(Adapter);
 }
 
+/* WLC_DOWN followed by WLC_UP. bcmdhd/brcmfmac use this pair to return a
+ * fullmac station to a defined idle state. The dongle keeps a stale
+ * AUTH/ASSOC context after some disconnects and then rejects the next
+ * join (BCME_BUSY); this reset clears it without touching the device. */
+static NTSTATUS FirmwareReset(SWIFI_JOIN *J, PSHORT FirmwareStatus)
+{
+    ULONG Zero = 0, One = 1;
+    USHORT Returned = 0;
+    SHORT Error = 0;
+    if (FirmwareStatus) *FirmwareStatus = 0;
+    (VOID)SwifiFirmwareCommand(J->Control, 0, 3, &Zero, sizeof(Zero), NULL, &Error); /* WLC_DOWN */
+    return SwifiFirmwareCommand(J->Control, 0, 2, &One, sizeof(One), &Returned, FirmwareStatus); /* WLC_UP */
+}
+
+static BOOLEAN ScanBusy(SWIFI_JOIN *J)
+{
+    return J->Scan != NULL && SwifiScanBusy(J->Scan);
+}
+
+static VOID LinkTick(WDFTIMER Timer)
+{
+    SWIFI_JOIN *J = LinkTimerContext(Timer)->Join;
+    BOOLEAN Poll;
+    WdfWaitLockAcquire(J->Lock, NULL);
+    Poll = J->Online && !J->Poisoned && !J->Leaving && J->Announced && J->Active;
+    WdfWaitLockRelease(J->Lock);
+    if (Poll) WdfWorkItemEnqueue(J->LinkWorker);
+    if (J->Online) WdfTimerStart(J->LinkTimer, WDF_REL_TIMEOUT_IN_MS(4000));
+}
+
 static VOID ReadLink(WDFWORKITEM Work)
 {
     SWIFI_JOIN *J = LinkWorkContext(Work)->Join;
     WdfWaitLockAcquire(J->Lock, NULL);
     if (!J->Online || J->Poisoned || J->Leaving || !J->Announced || !J->Active ||
         J->Port != J->PeerPort || !J->Control->Running) goto Done;
+
+    /* The dongle's current BSSID is authoritative for link liveness. Without
+     * this probe a link that dies silently (no DEAUTH event) stays "connected"
+     * forever: the tray shows Wi-Fi connected while every frame is dropped. */
+    {
+        UCHAR Current[6] = {0};
+        USHORT Returned = 0;
+        SHORT Firmware = 0;
+        BOOLEAN Alive = FALSE;
+        for (ULONG Try = 0; Try < 2 && !Alive; ++Try) {
+            RtlZeroMemory(Current, sizeof(Current));
+            Returned = 0;
+            Firmware = 0;
+            NTSTATUS Probe = SwifiFirmwareCommand(J->Control, 0, 23, Current, sizeof(Current),
+                &Returned, &Firmware);
+            Alive = NT_SUCCESS(Probe) && Returned == sizeof(Current) &&
+                RtlEqualMemory(Current, J->Active->Peer, 6);
+            if (!Alive && Firmware == -17) break; /* BCME_NOTASSOCIATED is final. */
+        }
+        if (!Alive) {
+            SwifiReportDown(&J->Owner->Report, 0xE5);
+            Down(J, WDI_ASSOC_STATUS_PEER_DISASSOCIATED);
+            goto Done;
+        }
+    }
 
     SWIFI_DEVICE *D = J->Owner;
     KIRQL Irql;
@@ -305,6 +367,19 @@ static VOID Poison(SWIFI_JOIN *J, NTSTATUS Reason)
     Finish(J, &J->Leave, Reason);
     KeSetEvent(&J->Left, IO_NO_INCREMENT, FALSE);
     SwifiPnpFailure(J->Owner, Reason);
+}
+
+/* Drop every join-side object that a failed attempt left behind so the next
+ * connect is not rejected as busy. The firmware join is re-issued later. */
+static VOID JoinReset(SWIFI_JOIN *J)
+{
+    SwifiFilterStop(J->Owner, FALSE);
+    SwifiDataLink(J->Owner, NULL, FALSE, FALSE, FALSE);
+    J->Associated = J->Announced = J->Leaving = J->RetryNext = FALSE;
+    J->Deadline = 0;
+    RtlSecureZeroMemory(&J->Keys, sizeof(J->Keys));
+    DropPending(J);
+    FreeActive(J);
 }
 
 static BOOLEAN Listed(const WDI_ADDRESS_LIST_CONTAINER *List, const UCHAR *Mac)
@@ -510,6 +585,25 @@ static VOID NextCandidate(SWIFI_JOIN *J)
         NTSTATUS Status = Vendors(J, TRUE);
         if (NT_SUCCESS(Status)) Status = SwifiJoinFirmware(J->Owner, J->Info, &C->Profile,
             C->Peer, C->Channel, C->HavePmkid ? C->Pmkid : NULL);
+        if (Status == STATUS_UNSUCCESSFUL && !C->Retried) {
+            /* The dongle refused the join (BCME_BUSY after a stale teardown is
+             * the classic case). Reset its station interface once and retry
+             * this same BSS instead of failing the whole connect. */
+            C->Retried = TRUE;
+            SHORT Fw = 0;
+            (VOID)FirmwareReset(J, &Fw);
+            SwifiReportDown(&J->Owner->Report, 0xE7);
+            SwifiFilterStop(J->Owner, FALSE);
+            SwifiDataLink(J->Owner, NULL, FALSE, FALSE, FALSE);
+            if (NT_SUCCESS(Vendors(J, FALSE))) {
+                C->VendorAdded = C->VendorRemoved = 0;
+                SwifiDataBeginJoin(J->Owner, C->Peer, C->Profile.auth == SWIFI_AUTH_PSK_CCMP,
+                    C->ExcludeUnencrypted);
+                if (NT_SUCCESS(Vendors(J, TRUE)))
+                    Status = SwifiJoinFirmware(J->Owner, J->Info, &C->Profile,
+                        C->Peer, C->Channel, C->HavePmkid ? C->Pmkid : NULL);
+            }
+        }
         if (NT_SUCCESS(Status)) {
             ULONGLONG Now = KeQueryInterruptTime();
             ULONG RemainingMs = J->ConnectEnd > Now ? (ULONG)((J->ConnectEnd-Now)/10000) : 1;
@@ -548,6 +642,7 @@ static NTSTATUS LinkIsDown(SWIFI_JOIN *J, BOOLEAN *Confirmed)
 static VOID Down(SWIFI_JOIN *J, WDI_ASSOC_STATUS Reason)
 {
     NTSTATUS Status = STATUS_SUCCESS;
+    BOOLEAN Residual = J->Associated || J->Announced || J->Leaving;
     SwifiFilterStop(J->Owner, FALSE);
     SwifiDataLink(J->Owner, NULL, FALSE, FALSE, FALSE);
     if (J->Active) {
@@ -562,6 +657,14 @@ static VOID Down(SWIFI_JOIN *J, WDI_ASSOC_STATUS Reason)
     J->Associated = J->Announced = J->Leaving = FALSE;
     FreeActive(J);
     J->Deadline = 0;
+    if (Residual) {
+        /* The link is gone on the host side. The dongle may still hold a
+         * half-closed AUTH/ASSOC context, and after such a teardown it can
+         * reject the next join with BCME_BUSY. The next connect resets the
+         * station interface in firmware before joining; the device itself
+         * is no longer re-created here. */
+        J->FirmwareDirty = TRUE;
+    }
     if (J->RetryNext && J->Connect.Memory && !J->Leave.Memory && NT_SUCCESS(Status)) {
         J->RetryNext = FALSE;
         NextCandidate(J);
@@ -606,8 +709,24 @@ static VOID JoinTimeout(WDFTIMER Timer)
     SWIFI_JOIN *J = JoinTimerContext(Timer)->Join;
     WdfWaitLockAcquire(J->Lock, NULL);
     if (J->Online && J->Deadline && KeQueryInterruptTime() >= J->Deadline) {
-        if (J->Leaving) Poison(J, STATUS_IO_TIMEOUT);
-        else (VOID)BeginLeave(J, 3, STATUS_IO_TIMEOUT, TRUE);
+        if (J->Leaving) {
+            /* The disconnect event never arrived. Ask the dongle for its
+             * BSSID; if it still holds the link, deauthenticate and mark the
+             * station interface dirty. The next connect resets it. */
+            BOOLEAN Confirmed = FALSE;
+            NTSTATUS Check = STATUS_SUCCESS;
+            if (J->Active) {
+                Check = LinkIsDown(J, &Confirmed);
+                if (!NT_SUCCESS(Check) || !Confirmed)
+                    if (J->Active) (VOID)SwifiLeaveFirmware(J->Control, J->Active->Peer, 3);
+                if (NT_SUCCESS(Check) && Confirmed) Check = STATUS_SUCCESS;
+            }
+            Finish(J, &J->Leave, Check);
+            J->FirmwareDirty = TRUE;
+            JoinReset(J);
+            J->Poisoned = FALSE;
+            KeSetEvent(&J->Left, IO_NO_INCREMENT, FALSE);
+        } else (VOID)BeginLeave(J, 3, STATUS_IO_TIMEOUT, TRUE);
     }
     WdfWaitLockRelease(J->Lock);
 }
@@ -650,6 +769,16 @@ NTSTATUS SwifiJoinCreate(WDFDEVICE Device, SWIFI_WIN_CONTROL *Control, SWIFI_FIR
     Status = WdfWorkItemCreate(&LinkConfig, &A, &J->LinkWorker);
     if (!NT_SUCCESS(Status)) return Status;
     LinkWorkContext(J->LinkWorker)->Join = J;
+    /* One-shot liveness timer; it re-arms itself from LinkTick. */
+    WDF_TIMER_CONFIG LinkTimerConfig;
+    WDF_TIMER_CONFIG_INIT(&LinkTimerConfig, LinkTick);
+    LinkTimerConfig.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&A, LINK_TIMER_CONTEXT);
+    A.ParentObject = Device;
+    A.ExecutionLevel = WdfExecutionLevelPassive;
+    Status = WdfTimerCreate(&LinkTimerConfig, &A, &J->LinkTimer);
+    if (!NT_SUCCESS(Status)) return Status;
+    LinkTimerContext(J->LinkTimer)->Join = J;
     J->Owner->Data.LinkWorker = J->LinkWorker;
     *Join = J;
     return STATUS_SUCCESS;
@@ -660,7 +789,9 @@ VOID SwifiJoinStartSession(SWIFI_JOIN *J)
     WdfWaitLockAcquire(J->Lock, NULL);
     J->Online = TRUE;
     J->Poisoned = FALSE;
+    J->FirmwareDirty = FALSE;
     WdfWaitLockRelease(J->Lock);
+    WdfTimerStart(J->LinkTimer, WDF_REL_TIMEOUT_IN_MS(4000));
 }
 
 VOID SwifiJoinEndSession(SWIFI_JOIN *J)
@@ -686,6 +817,7 @@ VOID SwifiJoinEndSession(SWIFI_JOIN *J)
     WdfWaitLockRelease(J->Lock);
     KeSetEvent(&J->Left, IO_NO_INCREMENT, FALSE);
     WdfTimerStop(J->Timer, TRUE);
+    WdfTimerStop(J->LinkTimer, TRUE);
     WdfWorkItemFlush(J->LinkWorker);
 }
 
@@ -749,9 +881,36 @@ NTSTATUS SwifiJoinRadioOff(SWIFI_JOIN *J)
     return Status;
 }
 
+/* Reset the station interface before a join if a teardown left it dirty.
+ * Called from the connect worker after any active scan is drained, so
+ * WLC_DOWN cannot strand a scanner waiting for its terminal event. */
+static NTSTATUS PrepareFirmwareForJoin(SWIFI_JOIN *J)
+{
+    SHORT Fw = 0;
+    if (!J->FirmwareDirty) return STATUS_SUCCESS;
+    if (ScanBusy(J)) return STATUS_SUCCESS; /* keep the dirty flag for later */
+    NTSTATUS Reset = FirmwareReset(J, &Fw);
+    SwifiReportDown(&J->Owner->Report, NT_SUCCESS(Reset) ? 0xE0 : 0xE1);
+    if (NT_SUCCESS(Reset)) {
+        J->FirmwareDirty = FALSE;
+        return STATUS_SUCCESS;
+    }
+    return Reset;
+}
+
 static NTSTATUS Connect(SWIFI_JOIN *J, WDI_MESSAGE_HEADER *H, ULONG Bytes)
 {
-    if (J->Active || J->Connect.Memory || J->Leave.Memory || J->Info->RadioDisabled)
+    if (J->Active) {
+        /* A new attempt arrives while a previous context still exists. */
+        SwifiReportDown(&J->Owner->Report, 0xD4);
+        if (J->Associated || J->Announced)
+            (VOID)SwifiLeaveFirmware(J->Control, J->Active->Peer, 3);
+        JoinReset(J);
+        J->FirmwareDirty = TRUE;
+        J->Poisoned = FALSE;
+    }
+    (VOID)PrepareFirmwareForJoin(J);
+    if (J->Connect.Memory || J->Leave.Memory || J->Info->RadioDisabled)
         return STATUS_DEVICE_BUSY;
     WDI_TASK_CONNECT_PARAMETERS P = {0};
     NTSTATUS Status = (NTSTATUS)ParseWdiTaskConnectToIhv(Bytes, (PUCHAR)(H+1), &J->Tlv, &P);
@@ -812,10 +971,13 @@ static NTSTATUS ChangeKeys(SWIFI_JOIN *J, UINT16 Id, WDI_MESSAGE_HEADER *H, ULON
 {
     if (!J->Associated || J->Leaving || J->Active->Profile.auth != SWIFI_AUTH_PSK_CCMP)
         return STATUS_INVALID_DEVICE_STATE;
+    if (Id == WDI_SET_ADD_CIPHER_KEYS) SwifiReportKeyAttempt(&J->Owner->Report);
+
     BOOLEAN Uncertain;
     BOOLEAN OldPair = J->Keys.Slot[4].Present;
     NTSTATUS Status = SwifiKeysChange(&J->Keys, J->Owner, J->Active->Peer, &J->Tlv,
         H, Bytes, Id == WDI_SET_ADD_CIPHER_KEYS, &Uncertain);
+    if (Id == WDI_SET_ADD_CIPHER_KEYS) { BOOLEAN Group = FALSE; for (ULONG K = 0; K < 4; ++K) Group |= J->Keys.Slot[K].Present; SwifiReportKeyKind(&J->Owner->Report, Group); SwifiReportKeyStatus(&J->Owner->Report, Status); }
     if (NT_SUCCESS(Status) && OldPair != J->Keys.Slot[4].Present) {
         UCHAR Address[6];
         RtlCopyMemory(Address, J->Active->Peer, 6);
@@ -895,6 +1057,8 @@ BOOLEAN SwifiJoinCommand(SWIFI_JOIN *J, WIFIREQUEST Request, UINT16 Id, WDI_MESS
     USHORT Reason = 3;
     NTSTATUS Status;
     WdfWaitLockAcquire(J->Lock, NULL);
+    /* A new connect request may recover a session that a failed link check poisoned. */
+    if (ConnectTask && J->Poisoned) J->Poisoned = FALSE;
     if (!J->Online || J->Poisoned || J->Port == WDI_PORT_ID_ADAPTER) Status = STATUS_DEVICE_NOT_READY;
     else if (J->Port != H->PortId || ((ConnectTask || Leave) && !H->TransactionId)) Status = STATUS_INVALID_PARAMETER;
     else if (ConnectTask) Status = Connect(J, H, Bytes);
@@ -909,7 +1073,14 @@ BOOLEAN SwifiJoinCommand(SWIFI_JOIN *J, WIFIREQUEST Request, UINT16 Id, WDI_MESS
     if (NT_SUCCESS(Status)) {
         if (ConnectTask) NextCandidate(J);
         else if (Leave) {
-            if (J->Active) (VOID)BeginLeave(J, Reason, STATUS_CANCELLED, FALSE);
+            if (J->Active && (J->Associated || J->Announced)) {
+                /* Host-requested disconnect on a live link: deauthenticate in
+                 * firmware, tear the host state down and complete the task.
+                 * No PnP restart: the next connect reuses this driver. */
+                SwifiReportDown(&J->Owner->Report, 0xD3);
+                (VOID)SwifiLeaveFirmware(J->Control, J->Active->Peer, Reason);
+                Down(J, WDI_ASSOC_STATUS_DISASSOCIATED_BY_HOST);
+            } else if (J->Active) (VOID)BeginLeave(J, Reason, STATUS_CANCELLED, FALSE);
             else Finish(J, &J->Leave, STATUS_SUCCESS);
         }
     }
@@ -922,8 +1093,9 @@ BOOLEAN SwifiJoinEvent(SWIFI_JOIN *J, const swifi_event_completion *E)
     const UCHAR *P = E->data;
     if (E->firmware_status || E->ifidx || !P || E->length < 72 || P[12] != 0x88 || P[13] != 0x6c ||
         P[19] || P[20] != 0x10 || P[21] != 0x18 || P[22] || P[23] != 1 || P[70] ||
-        SwifiScanBe32(P+44) > E->length - 72u) return FALSE;
+        SwifiScanBe32(P+44) > E->length - 72u) { SwifiReportEvent(&J->Owner->Report, TRUE, 0xFFFFFFFF); return FALSE; }
     ULONG Type = SwifiScanBe32(P+28), Status = SwifiScanBe32(P+32);
+    SwifiReportEvent(&J->Owner->Report, FALSE, Type);
     BOOLEAN DownEvent = Type == 5 || Type == 6 || Type == 11 || Type == 12 || (Type == 16 && !(P[27] & 1));
     if (Type != 0 && !DownEvent && Type != 19) return FALSE;
     WdfWaitLockAcquire(J->Lock, NULL);
@@ -951,8 +1123,11 @@ BOOLEAN SwifiJoinEvent(SWIFI_JOIN *J, const swifi_event_completion *E)
             BOOLEAN Confirmed = Same;
             NTSTATUS Check = Same ? STATUS_SUCCESS : LinkIsDown(J, &Confirmed);
             if (!NT_SUCCESS(Check)) Poison(J, Check);
-            else if (Confirmed) Down(J, Type == 5 || Type == 6 ?
+            else if (Confirmed) {
+                SwifiReportDown(&J->Owner->Report, Type);
+                Down(J, Type == 5 || Type == 6 ?
                 WDI_ASSOC_STATUS_PEER_DEAUTHENTICATED : WDI_ASSOC_STATUS_PEER_DISASSOCIATED);
+            }
         }
         goto Done;
     }

@@ -99,7 +99,7 @@ size_t swifi_ether_eapol(uint8_t *frame, size_t length)
 size_t swifi_clear_eapol(uint8_t *f, size_t n, const uint8_t station[6], const uint8_t peer[6])
 {
     if (!f || !station || !peer || n < 24 || (f[0] != 8 && f[0] != 0x88) ||
-        (f[1] & 0x47) != 2 || (f[22] & 15) || memcmp(f+10, peer, 6) ||
+        (f[1] & 0x07) != 2 || (f[22] & 15) || memcmp(f+10, peer, 6) ||
         (f[16] & 1) || !memcmp(f+16, "\0\0\0\0\0\0", 6) || (!(f[4]&1) && memcmp(f+4, station, 6))) return 0;
     size_t offset = 24;
     if (f[0] == 0x88) {

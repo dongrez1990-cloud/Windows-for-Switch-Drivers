@@ -15,7 +15,11 @@ param(
   [string[]]$Defines = @(),
   [string]$Inf,
   [string]$KmdfVersion = '1.15',
+  [string]$WdkVersion = '10.0.19041.0',   # headers + km libs to compile against (22621 for WiFiCx)
+  [string]$NtddiVersion = '0x0A000008',   # Win10 20H1; NetAdapterCx 2.x needs FE (0x0A00000A) or newer
   [string[]]$ExtraIncludes = @(),   # searched after the WDK 10.0.19041 headers (e.g. km\spb\1.0)
+  [string[]]$IncludePaths = @(),    # plain /I paths, searched BEFORE the system headers (shadows SDK headers)
+  [string[]]$Inf2CatOs = @('10_VB_ARM64'),
   [switch]$NoSign,
   [switch]$Wdm                      # plain WDM driver (DriverEntry, no KMDF), e.g. an sdport miniport
 )
@@ -23,13 +27,15 @@ param(
 $ErrorActionPreference = 'Stop'
 $Llvm = 'C:\Program Files\LLVM\bin'
 $Kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
-$Wdk = '10.0.19041.0'
+$Wdk = $WdkVersion
 $Inc = "$Kits\Include\$Wdk"
 $KmLib = "$Kits\Lib\$Wdk\km\arm64"
 $KmdfInc = "$Kits\Include\wdf\kmdf\$KmdfVersion"
 $KmdfLib = "$Kits\Lib\wdf\kmdf\arm64\$KmdfVersion"
-$SignTool = "$Kits\bin\10.0.26100.0\x64\signtool.exe"
-$Inf2Cat = "$Kits\bin\10.0.26100.0\x86\Inf2Cat.exe"
+$SignTool = "$Kits\bin\$Wdk\x64\signtool.exe"
+$Inf2Cat = "$Kits\bin\$Wdk\x86\Inf2Cat.exe"
+if (-not (Test-Path $Inf2Cat)) { $Inf2Cat = "$Kits\bin\10.0.19041.0\x86\Inf2Cat.exe" }
+if (-not (Test-Path $SignTool)) { $SignTool = "$Kits\bin\10.0.19041.0\x64\signtool.exe" }
 $CertSubject = 'CN=SwitchWOA Test Driver Signing'
 $CertDir = Join-Path $PSScriptRoot 'cert'
 
@@ -44,11 +50,11 @@ $cflags = @(
   '--target=aarch64-pc-windows-msvc', '/c', '/kernel', '/GS-', '/Gy', '/Zl', '/O2', '/W4', '/WX',
   '-Wno-unused-parameter', '-Wno-microsoft-anon-tag', '-Wno-ignored-pragma-intrinsic',
   '-Wno-pragma-pack', '-Wno-invalid-token-paste', '-Wno-unknown-pragmas', '-Wno-ignored-attributes', '-Wno-nonportable-include-path',
-  '/D_ARM64_', '/DARM64', '/D_WIN64', '/DNTDDI_VERSION=0x0A000008', '/D_WIN32_WINNT=0x0A00', '/DWINVER=0x0A00',
+  '/D_ARM64_', '/DARM64', '/D_WIN64', "/DNTDDI_VERSION=$NtddiVersion", '/D_WIN32_WINNT=0x0A00', '/DWINVER=0x0A00',
   '/DKMDF_VERSION_MAJOR=1', "/DKMDF_VERSION_MINOR=$KmdfMinor", '/DPOOL_NX_OPTIN=1',
   # WDK headers as system headers: their warnings are not ours (/W4 /WX applies to our sources only).
   "/imsvc$Inc\km\crt", "/imsvc$Inc\km", "/imsvc$Inc\shared", "/imsvc$KmdfInc"
-) + ($ExtraIncludes | ForEach-Object { "/imsvc$($_ -replace '^\$Kits', $Kits)" }) + ($Defines | ForEach-Object { "/D$_" })
+) + ($IncludePaths | ForEach-Object { "/I$_" }) + ($ExtraIncludes | ForEach-Object { "/imsvc$($_ -replace '^\$Kits', $Kits)" }) + ($Defines | ForEach-Object { "/D$_" })
 
 $objs = @()
 foreach ($s in @($Sources) + (Join-Path $PSScriptRoot 'kmdf_support.c')) {
@@ -91,7 +97,7 @@ Export-Certificate -Cert $cert -FilePath (Join-Path $CertDir 'SwitchWOA-Test.cer
 & $SignTool sign /q /fd sha256 /sha1 $cert.Thumbprint /s My $sys
 if ($LASTEXITCODE -ne 0) { throw 'signtool failed (sys)' }
 if ($Inf) {
-  & $Inf2Cat "/driver:$OutDir" '/os:10_VB_ARM64' '/uselocaltime' | Out-Null
+  & $Inf2Cat "/driver:$OutDir" "/os:$($Inf2CatOs -join ',')" '/uselocaltime' | Out-Null
   if ($LASTEXITCODE -ne 0) { throw 'Inf2Cat failed' }
   Get-ChildItem $OutDir -Filter *.cat | ForEach-Object {
     & $SignTool sign /q /fd sha256 /sha1 $cert.Thumbprint /s My $_.FullName

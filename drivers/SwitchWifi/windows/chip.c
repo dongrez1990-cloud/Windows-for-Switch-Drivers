@@ -154,7 +154,7 @@ static NTSTATUS ProbeBar(SWIFI_PCIE_RESOURCES *Bus, USHORT Offset,
 
 NTSTATUS SwifiChipMapAndDiscover(SWIFI_CHIP *C, SWIFI_PCIE_RESOURCES *Bus)
 {
-    ULONG Command, Bar0, Bar2, Erom, Value, Banks, Index;
+    ULONG Command, Bar0, Bar2, Erom, Value, Banks, Index, Window;
     uint32_t *Words = NULL;
     PEX_CORE Cores[32];
     size_t Count = 0;
@@ -171,6 +171,16 @@ NTSTATUS SwifiChipMapAndDiscover(SWIFI_CHIP *C, SWIFI_PCIE_RESOURCES *Bus)
     SwifiConfigWrite(Bus, 4, Command & ~6u);
     if (SwifiConfigRead(Bus, 4) & 6)
         return STATUS_DEVICE_PROTOCOL_ERROR;
+    /* Open the root port's memory window here instead of in the firmware.
+       The Erista hand-off boots Windows fine while the window is closed, but as
+       soon as the firmware leaves it open the Windows Boot Manager fails with
+       BCD 0xc0000102, so the device is handed over with the window shut and the
+       driver opens it now, where a failure only costs this device. */
+    Window = ((SWIFI_APERTURE_BASE >> 16) & 0xfff0u) |
+             ((((SWIFI_APERTURE_BASE + SWIFI_APERTURE_SIZE - 1) >> 16) & 0xfff0u) << 16);
+    WRITE_REGISTER_ULONG((PULONG)(Bus->Host + SWIFI_ROOT_OFFSET + 0x20), Window);
+    if ((READ_REGISTER_ULONG((PULONG)(Bus->Host + SWIFI_ROOT_OFFSET + 0x20)) & 0xfff0fff0u) != Window)
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
     Status = ProbeBar(Bus, 0x10, &Bar0, &C->Bar0Length);
     if (NT_SUCCESS(Status))
         Status = ProbeBar(Bus, 0x18, &Bar2, &C->Bar2Length);

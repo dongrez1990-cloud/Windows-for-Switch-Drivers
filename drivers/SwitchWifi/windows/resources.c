@@ -66,11 +66,25 @@ VOID SwifiUnmapResources(SWIFI_PCIE_RESOURCES *Bus)
 
 static ULONG SwifiSelectConfig(SWIFI_PCIE_RESOURCES *Bus, USHORT Offset)
 {
-    /* Tegra's extended config-register bits are not standard ECAM bits. */
+    /* Tegra's extended config-register bits are not standard ECAM bits.
+     *
+     * Linux tegra_pcie_conf_address() maps a bus!=0 access by MOVING the AXI
+     * config window: AFI_AXI_BAR0_START restarts at PEX_CS - page, its size
+     * covers that page, AFI_FPCI_BAR0 keeps its type-1 base 0xfe100000 and the
+     * access lands at PEX_CS + (Address & 0xFFC). The previous version rewrote
+     * AFI_FPCI_BAR0 per access with (Address >> 8), the exact scheme the UEFI
+     * hand-off had to abandon: it decoded to the wrong FPCI block, so some
+     * reads returned the endpoint and others returned 0xFFFFFFFF. On the
+     * console that surfaced as STATUS_DEVICE_DOES_NOT_EXIST from the vendor
+     * ID read. Keep this in step with WifiPcie.h:PexCfgWindow(). */
     ULONG Address = ((ULONG)(Offset & 0xf00u) << 16) | (1u << 16) | (Offset & 0xffu);
-    PULONG Window = (PULONG)(Bus->Host + SWIFI_AFI_OFFSET + 0x30);
-    WRITE_REGISTER_ULONG(Window, 0xfe100000u + ((Address & ~0xfffu) >> 8));
-    (VOID)READ_REGISTER_ULONG(Window);
+    ULONG Page = Address & ~0xfffu;
+    PULONG Size = (PULONG)(Bus->Host + SWIFI_AFI_OFFSET + 0x00); /* AFI_AXI_BAR0_SZ */
+    PULONG Start = (PULONG)(Bus->Host + SWIFI_AFI_OFFSET + 0x18); /* AFI_AXI_BAR0_START */
+    WRITE_REGISTER_ULONG(Start, (ULONG)(SWIFI_CONFIG_BASE - Page));
+    (VOID)READ_REGISTER_ULONG(Start);
+    WRITE_REGISTER_ULONG(Size, (Page + 0x1000u) >> 12);
+    (VOID)READ_REGISTER_ULONG(Size);
     return Address & 0xffcu;
 }
 

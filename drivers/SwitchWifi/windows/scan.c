@@ -29,6 +29,7 @@ struct SWIFI_SCAN {
     WDI_PORT_ID Port;
     USHORT Sync;
     ULONG Repeat, DisallowedBands;
+    ULONGLONG StuckAt;
     NTSTATUS DrainStatus;
     ULONGLONG Deadline, MaximumEnd, BatchEnd;
     WDFMEMORY DoneMemory;
@@ -84,6 +85,10 @@ static void ArmTimer(SWIFI_SCAN *S)
     if (!S->DoneMemory || !S->Online) return;
     ULONGLONG Next = S->Deadline, Now = KeQueryInterruptTime();
     if (S->BatchEnd && !S->Draining && S->BatchEnd < Next) Next = S->BatchEnd;
+    if (S->DoneMemory && S->StuckAt) {
+        ULONGLONG Cap = S->StuckAt + SCAN_MS(8000);
+        if (Next > Cap) Next = Cap;
+    }
     WdfTimerStart(S->Timer, Next <= Now ? -1 : -(LONGLONG)(Next - Now));
 }
 
@@ -449,6 +454,7 @@ static NTSTATUS Begin(SWIFI_SCAN *S, const WDI_MESSAGE_HEADER *Header, UINT Inpu
     }
     *Done = *Header;
     S->DoneMemory = Completion;
+    S->StuckAt = KeQueryInterruptTime();
     S->Done = Done;
     KeClearEvent(&S->Idle);
     return STATUS_SUCCESS;
@@ -520,6 +526,12 @@ static VOID ScanTimer(WDFTIMER Timer)
     WdfWaitLockAcquire(S->Lock, NULL);
     if (S->Online && S->DoneMemory && S->Control->Running) {
         ULONGLONG Now = KeQueryInterruptTime();
+        if (!S->Draining && S->StuckAt && Now > S->StuckAt + SCAN_MS(8000)) {
+            /* Firmware never confirmed this scan: release it so the next one can start. */
+            Finish(S, STATUS_IO_TIMEOUT, FALSE);
+            WdfWaitLockRelease(S->Lock);
+            return;
+        }
         if (Now >= S->Deadline) {
             if (S->Draining) {
                 /* Some terminal events carry no sync ID. Only reset can now
@@ -564,6 +576,17 @@ VOID SwifiScanStation(SWIFI_SCAN *S, WDI_PORT_ID Port, BOOLEAN Present)
         S->Port = WDI_PORT_ID_ADAPTER;
     }
     WdfWaitLockRelease(S->Lock);
+}
+
+/* A scan task is live. Used by the join path to defer any interface reset
+ * that would kill the scanner's terminal event. */
+BOOLEAN SwifiScanBusy(SWIFI_SCAN *S)
+{
+    BOOLEAN Busy;
+    WdfWaitLockAcquire(S->Lock, NULL);
+    Busy = S->DoneMemory != NULL;
+    WdfWaitLockRelease(S->Lock);
+    return Busy;
 }
 
 VOID SwifiScanStartSession(SWIFI_SCAN *S)

@@ -183,7 +183,7 @@ static VOID RxComplete(void *Context, const swifi_packet_completion *Completion)
         if (!Length) { Observe(D, PathEapolHeaderDrop); ++D->RxDrops; return; }
     }
     BOOLEAN Eapol = IsEapol(Frame), Group = (Frame[0] & 1) != 0;
-    if (Eapol) Observe(D, PathEapol);
+    if (Eapol) { Observe(D, PathEapol); SwifiReportEapol(Report); }
     if (!swifi_filter_accepts(&Owner->Filter, D->Address, Frame)) {
         if (Eapol) Observe(D, PathFilterDrop);
         ++D->RxDrops;
@@ -231,6 +231,7 @@ static VOID RxComplete(void *Context, const swifi_packet_completion *Completion)
     if (Eapol) Observe(D, PathQueued);
     Slot->Offset = Completion->offset;
     Slot->Length = Length;
+    D->LastRxTicks = KeQueryInterruptTime();
     InsertTailList(&D->ReadyRx, &Slot->Link);
 }
 
@@ -447,6 +448,7 @@ VOID SwifiDataLink(SWIFI_DEVICE *Device, const UCHAR *Peer, BOOLEAN Secure, BOOL
     D->Pairwise = Peer && Pairwise;
     D->Group = Peer && Group;
     if (Peer) RtlCopyMemory(D->Peer, Peer, 6);
+    if (Peer) D->LastRxTicks = KeQueryInterruptTime();
     ++D->TxProgress;
     KeReleaseSpinLock(&Device->Hw.ProtocolLock, Irql);
     SwifiDataNotify(Device);

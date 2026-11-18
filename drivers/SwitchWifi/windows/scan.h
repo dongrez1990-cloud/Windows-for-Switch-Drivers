@@ -17,5 +17,6 @@ VOID SwifiScanEndSession(SWIFI_SCAN *Scan);
 VOID SwifiScanStation(SWIFI_SCAN *Scan, WDI_PORT_ID Port, BOOLEAN Present);
 VOID SwifiScanRequest(SWIFI_SCAN *Scan, WIFIREQUEST Request, BOOLEAN Abort);
 NTSTATUS SwifiScanDrain(SWIFI_SCAN *Scan);
+BOOLEAN SwifiScanBusy(SWIFI_SCAN *Scan);
 
 #endif

@@ -46,13 +46,19 @@ int main(void)
     uint8_t native[40] = {8,2};
     memcpy(native+4,sta,6); memcpy(native+10,ap,6); memcpy(native+16,ap,6);
     const uint8_t pae[] = {0xaa,0xaa,3,0,0,0,0x88,0x8e,2,3,0,2,0xab,0xcd};
+    /* A firmware-decrypted EAPOL still carries the 802.11 Protected bit (M3). */
+    memset(native, 0, sizeof(native)); native[0] = 8; native[1] = 0x42;
+    memcpy(native+4,sta,6); memcpy(native+10,ap,6); memcpy(native+16,ap,6);
     memcpy(native+24,pae,sizeof(pae));
-    native[1]|=0x40; assert(!swifi_clear_eapol(native,38,sta,ap)); native[1]=2;
-    assert(!swifi_clear_eapol(native,37,sta,ap));
     assert(swifi_clear_eapol(native,38,sta,ap)==20);
     assert(!memcmp(native,sta,6) && !memcmp(native+6,ap,6) && native[12]==0x88 && native[19]==0xcd);
-    const uint8_t authsrc[6] = {2,9,8,7,6,5};
+    /* A short native EAPOL is still rejected. */
+    memset(native, 0, sizeof(native)); native[0] = 8; native[1] = 2;
+    memcpy(native+4,sta,6); memcpy(native+10,ap,6); memcpy(native+16,ap,6);
+    memcpy(native+24,pae,sizeof(pae));
+    assert(!swifi_clear_eapol(native,37,sta,ap));
     /* An AP may bridge an authenticator with a distinct Ethernet source. */
+    const uint8_t authsrc[6] = {2,9,8,7,6,5};
     memset(native, 0, sizeof(native)); native[0] = 8; native[1] = 2;
     memcpy(native+4,sta,6); memcpy(native+10,ap,6); memcpy(native+16,authsrc,6);
     memcpy(native+24,pae,sizeof(pae));

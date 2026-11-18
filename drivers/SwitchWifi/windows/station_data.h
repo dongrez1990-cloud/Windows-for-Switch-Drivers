@@ -56,6 +56,7 @@ typedef struct SWIFI_STATION_DATA {
     ULONGLONG SampleTime, NextLinkCheck;
     WDFWORKITEM LinkWorker;
     ULONG64 TxErrors, RxDrops;
+    ULONGLONG LastRxTicks;
 } SWIFI_STATION_DATA;
 
 struct SWIFI_QUEUE {

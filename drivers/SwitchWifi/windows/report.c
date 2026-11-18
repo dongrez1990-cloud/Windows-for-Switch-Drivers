@@ -35,9 +35,9 @@ static VOID WriteReport(WDFWORKITEM Work)
         KeReleaseSpinLock(&R->Lock,Irql);
         WCHAR Text[512];
         NTSTATUS Status = RtlStringCchPrintfW(Text, RTL_NUMBER_OF(Text),
-            L"v=5 session=%u step=%u/%08X failure=%u/%08X scan=%u/%08X join=%u/%08X "
+            L"v=11 session=%u step=%u/%08X failure=%u/%08X scan=%u/%08X join=%u/%08X "
             L"keys=%u add=%u del=%u eth_pre=%u eth_unknown=%u native_clear=%u "
-            L"native_protected=%u meta=%u rssi=%u malformed=%u filter=%X/%u/%u/%08X hw=%u/%08X irq=%u ring=%u select=%X/%X/%u/%u/%u/%X path=%X credits=%u",
+            L"native_protected=%u meta=%u rssi=%u malformed=%u filter=%X/%u/%u/%08X hw=%u/%08X irq=%u ring=%u select=%X/%X/%u/%u/%u/%X path=%X credits=%u erx=%u kadd=%u kfail=%u kstat=%08X dn=%u/%X kp=%u kg=%u ev=%u/%u/%X",
             D.Session,D.Step,(ULONG)D.StepStatus,D.FailedStep,(ULONG)D.FailureStatus,
             D.Scans,(ULONG)D.ScanStatus,D.Attempts,(ULONG)D.JoinStatus,D.KeyMask,
             D.KeyInstalls,D.KeyRemovals,D.Count[SwifiRxEtherBeforeKey],D.Count[SwifiRxEtherUncertain],
@@ -45,7 +45,8 @@ static VOID WriteReport(WDFWORKITEM Work)
             D.Count[SwifiRxRssiSeen],D.Count[SwifiRxMetaInvalid],
             D.FilterFlags,D.FilterCount,D.FilterMode,(ULONG)D.FilterStatus,D.HardwareStep,(ULONG)D.HardwareStatus,
             D.IrqSeen,D.RingSeen,D.Selection.Policy,D.Selection.Auth,D.Selection.Names,
-            D.Selection.Offered,D.Selection.Accepted,D.Selection.Rejected,D.PacketPath,D.ReceiveCredits);
+            D.Selection.Offered,D.Selection.Accepted,D.Selection.Rejected,D.PacketPath,D.ReceiveCredits,
+            D.EapolFrames,D.KeyAdds,D.KeyFails,(ULONG)D.KeyStatus,D.DownEvents,D.LastDownType,D.KeyPair,D.KeyGroup,D.EvSeen,D.EvDropped,D.EvTypeMask);
         if (NT_SUCCESS(Status)) {
             UNICODE_STRING Value;
             RtlInitUnicodeString(&Value, Text);
@@ -201,4 +202,58 @@ VOID SwifiReportFlush(SWIFI_REPORT *R)
     ScheduleLocked(R);
     KeReleaseSpinLock(&R->Lock,Irql);
     WdfWorkItemFlush(R->Worker);
+}
+
+VOID SwifiReportEapol(SWIFI_REPORT *R)
+{
+    KIRQL Irql;
+    KeAcquireSpinLock(&R->Lock, &Irql);
+    ++R->Data.EapolFrames;
+    ScheduleLocked(R);
+    KeReleaseSpinLock(&R->Lock, Irql);
+}
+
+VOID SwifiReportKeyAttempt(SWIFI_REPORT *R)
+{
+    KIRQL Irql;
+    KeAcquireSpinLock(&R->Lock, &Irql);
+    ++R->Data.KeyAdds;
+    ScheduleLocked(R);
+    KeReleaseSpinLock(&R->Lock, Irql);
+}
+
+VOID SwifiReportKeyStatus(SWIFI_REPORT *R, NTSTATUS Status)
+{
+    KIRQL Irql;
+    KeAcquireSpinLock(&R->Lock, &Irql);
+    if (!NT_SUCCESS(Status)) { ++R->Data.KeyFails; R->Data.KeyStatus = Status; }
+    ScheduleLocked(R);
+    KeReleaseSpinLock(&R->Lock, Irql);
+}
+VOID SwifiReportDown(SWIFI_REPORT *R, ULONG Type)
+{
+    KIRQL Irql;
+    KeAcquireSpinLock(&R->Lock, &Irql);
+    ++R->Data.DownEvents;
+    R->Data.LastDownType = Type;
+    ScheduleLocked(R);
+    KeReleaseSpinLock(&R->Lock, Irql);
+}
+
+VOID SwifiReportKeyKind(SWIFI_REPORT *R, BOOLEAN Group)
+{
+    KIRQL Irql;
+    KeAcquireSpinLock(&R->Lock, &Irql);
+    if (Group) ++R->Data.KeyGroup; else ++R->Data.KeyPair;
+    ScheduleLocked(R);
+    KeReleaseSpinLock(&R->Lock, Irql);
+}
+VOID SwifiReportEvent(SWIFI_REPORT *R, BOOLEAN Dropped, ULONG Type)
+{
+    KIRQL Irql;
+    KeAcquireSpinLock(&R->Lock, &Irql);
+    ++R->Data.EvSeen;
+    if (Dropped) ++R->Data.EvDropped; else if (Type < 32) R->Data.EvTypeMask |= 1u << Type;
+    ScheduleLocked(R);
+    KeReleaseSpinLock(&R->Lock, Irql);
 }

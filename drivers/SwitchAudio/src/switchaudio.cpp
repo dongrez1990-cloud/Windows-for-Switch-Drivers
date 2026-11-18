@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Nintendo Switch audio driver (speaker), PortCls WaveRT. Stage 1.
  *
  * ACPI device AUD0 (ACPI\SWOA0C01), UEFI R402+:
@@ -75,6 +75,14 @@
  * 1.0.0.9: read the pad/clock and digital mixer state for the Lite Linux
  * initialization comparison. Record PCM peak/nonzero counts at existing
  * start/stop snapshots; this reads application audio and generates no tone.
+ *
+ * 1.0.0.10: the codec snapshot also runs at every device start (after the
+ * AUD0 SPB open), so a silent speaker can be compared against the UEFI R402
+ * setup without waiting for a jack change.
+ *
+ * 1.0.0.11: Parameters\TestTone = 2 plays the same 1 kHz tone at full scale
+ * for three seconds (ToneGain/ToneEnd traces), so "too quiet" and "the path
+ * is not wired at all" can be told apart on the real speaker.
  */
 
 #define INITGUID
@@ -155,13 +163,34 @@
 #define GPIO_PV_OE               0x514u
 #define GPIO_PV_IN               0x534u
 #define GPIO_PV6                 (1u << 6)
+#define GPIO_PZ_CNF              0x604u          /* port Z: bank 6, port 1 */
+#define GPIO_PZ_OE               0x614u
+#define GPIO_PZ_OUT              0x624u
+#define GPIO_PZ_IN               0x634u
+#define GPIO_PZ4                 (1u << 4)       /* codec LDO1 enable (active high) */
 #define RT5640_SPK_VOL           0x01
 #define RT5640_HP_VOL            0x02
 #define RT5640_HPO_MIXER         0x45
 #define RT5640_M_HPVOL_HM        (1u << 13)
 #define SA_SPK_VOL               0x1414u         /* -18 dB, as UEFI R402 */
+#define SA_SPK_VOL_0DB           0x0808u         /* 0 dB, as the UEFI R395 tone */
 #define SA_HP_VOL                0x1818u         /* -24 dB, as UEFI R403 */
 #define SA_MUTE                  0x8080u
+#define RT5640_STO_DAC_MIXER     0x2au
+#define RT5640_SPK_L_MIXER       0x46u
+#define RT5640_SPK_R_MIXER       0x47u
+#define RT5640_PWR_DIG1          0x61u
+#define RT5640_PWR_ANLG1         0x63u
+#define RT5640_PWR_ANLG2         0x64u
+#define RT5640_PWR_MIXER         0x65u
+#define RT5640_PWR_VOL           0x66u
+#define RT5640_PRIV_INDEX        0x6au
+#define RT5640_PRIV_DATA         0x6cu
+#define RT5640_I2S1_SDP          0x70u
+#define RT5640_GLB_CLK           0x80u
+#define RT5640_PLL_CTRL1         0x81u
+#define RT5640_PLL_CTRL2         0x82u
+#define RT5640_RESET             0x00u
 
 typedef struct _SA_HW {
     volatile UCHAR *Ahub;
@@ -207,9 +236,57 @@ static ULONG ReadPhys(ULONGLONG Address)
     return Value;
 }
 
+/* 1.0.0.13: the DAP1 (I2S1) pads are level-shifted against the audio pad
+   group's IO rail, which on this board is MAX77620 SD3 at 1.8 V (L4T:
+   pmc-iopower { vddio-audio = <&max77620_sd3> }). The WinX firmware only
+   performs this pad selection for the Lite profile (t214/audio-pads.h); on
+   Erista PMC_PWR_DET_VAL still says 3.3 V for AUDIO(bit5) and AUDIO_HV(bit18)
+   while the rail is 1.8 V. Set the same bits the Lite path sets: enable the
+   PWR_DET writes, then select 1.8 V for those two groups. */
+#define APB_MISC_PHYS        0x70000000ULL
+#define PINMUX_TOUCH_RST_PV6 0x214u
+#define PMC_PWR_DET          0x48
+#define PMC_PWR_DET_VAL      0xE4
+#define PMC_AUDIO_BITS       ((1u << 5) | (1u << 18))
+
+static VOID WritePhys(ULONGLONG Address, ULONG Value)
+{
+    PHYSICAL_ADDRESS Pa;
+    volatile ULONG *Va;
+    Pa.QuadPart = (LONGLONG)Address;
+    Va = (volatile ULONG *)MmMapIoSpaceEx(Pa, sizeof(ULONG), PAGE_READWRITE | PAGE_NOCACHE);
+    if (Va != NULL) {
+        WRITE_REGISTER_ULONG(Va, Value);
+        MmUnmapIoSpace((PVOID)Va, sizeof(ULONG));
+    }
+}
+
+static VOID SaAudioPads18V(VOID)
+{
+    ULONG Det = ReadPhys(PMC_PHYS + PMC_PWR_DET);
+    ULONG Val = ReadPhys(PMC_PHYS + PMC_PWR_DET_VAL);
+    ULONG ValAfter;
+
+    SaTrace(L"PadDetBefore", Det);
+    SaTrace(L"PadValBefore", Val);
+    /* 1.0.0.15: idempotent. If the audio pad groups already select 1.8 V and
+       their PWR_DET writes are already enabled, leave the PMC alone. */
+    if ((Det & PMC_AUDIO_BITS) == PMC_AUDIO_BITS && (Val & PMC_AUDIO_BITS) == 0) {
+        SaTrace(L"PadAlready18V", 1);
+        return;
+    }
+    WritePhys(PMC_PHYS + PMC_PWR_DET, Det | PMC_AUDIO_BITS);
+    WritePhys(PMC_PHYS + PMC_PWR_DET_VAL, Val & ~PMC_AUDIO_BITS);
+    Det = ReadPhys(PMC_PHYS + PMC_PWR_DET);
+    ValAfter = ReadPhys(PMC_PHYS + PMC_PWR_DET_VAL);
+    SaTrace(L"PadDetAfter", Det);
+    SaTrace(L"PadValAfter", ValAfter);
+    SaTrace(L"PadFixVerified",
+            ((Det & PMC_AUDIO_BITS) == PMC_AUDIO_BITS && (ValAfter & PMC_AUDIO_BITS) == 0));
+}
+
 /* Bit 0: APE partition on, 1: d_audio on and out of reset, 2: APE clock,
-   3: I2S (CAR i2s0) clock. All four must be set before touching the AHUB. */
-static ULONG SaCheckApe(VOID)
+   3: I2S (CAR i2s0) clock. All four must be set before touching the AHUB. */static ULONG SaCheckApe(VOID)
 {
     ULONG Ok = 0;
     if ((ReadPhys(PMC_PHYS + PMC_PWRGATE_STATUS) & PMC_PG_AUD) != 0) Ok |= 1;
@@ -280,6 +357,24 @@ static VOID SaSleepMs(ULONG Ms)
     (VOID)KeDelayExecutionThread(KernelMode, FALSE, &Due);
 }
 
+/* Same as SaReadParam but returns an explicit default when the value is absent. */
+static ULONG SaReadParamEx(PCWSTR Name, ULONG Default)
+{
+    RTL_QUERY_REGISTRY_TABLE Table[2];
+    ULONG Value = Default;
+
+    if (g_ParamsPath[0] == L'\0') return Default;
+    RtlZeroMemory(Table, sizeof(Table));
+    Table[0].Flags = RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK;
+    Table[0].Name = (PWSTR)Name;
+    Table[0].EntryContext = &Value;
+    Table[0].DefaultType = (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_NONE;
+    if (!NT_SUCCESS(RtlQueryRegistryValues(RTL_REGISTRY_SERVICES, g_ParamsPath, Table, NULL, NULL))) {
+        return Default;
+    }
+    return Value;
+}
+
 static ULONG SaReadParam(PCWSTR Name)
 {
     RTL_QUERY_REGISTRY_TABLE Table[2];
@@ -297,12 +392,17 @@ static ULONG SaReadParam(PCWSTR Name)
 
 /* 1.0.0.2: Parameters\TestTone = 1 plays one second of 1 kHz (-18 dBFS) at the
    next start, from the driver's own buffer: checks the hardware path without
-   the Windows audio engine. The value is cleared afterwards. */
-static VOID SaTestTone(VOID)
+   the Windows audio engine. The value is cleared afterwards.
+   1.0.0.11: TestTone = 2 plays the same tone at full scale (-18 dBFS is 18 dB
+   below it) for three seconds, so "too quiet" and "not connected" can be told
+   apart on a real speaker. */
+static VOID SaTestTone(ULONG Level)
 {
     PHYSICAL_ADDRESS Low, High, Skip;
     ULONG *Words;
     ULONG Index;
+    ULONG Gain = (Level >= 2) ? 8u : 1u;
+    ULONG PlayMs = (Level >= 2) ? 3000u : 1000u;
     /* One 1 kHz period at 48 kHz, 1/8 of full scale (the UEFI R400 tone). */
     static const SHORT Sine[48] = {
             0,   535,  1060,  1567,  2048,  2493,  2896,  3250,  3547,  3784,  3956,  4061,
@@ -321,8 +421,12 @@ static VOID SaTestTone(VOID)
         SaTrace(L"ToneResult", 1);
         return;
     }
+    SaTrace(L"ToneGain", Gain);
     for (Index = 0; Index < 48; ++Index) {
-        Words[Index] = ((ULONG)(USHORT)Sine[Index] << 16) | (USHORT)Sine[Index];
+        LONG Sample = (LONG)Sine[Index] * (LONG)Gain;
+        if (Sample > 32767) Sample = 32767;
+        if (Sample < -32768) Sample = -32768;
+        Words[Index] = ((ULONG)(USHORT)Sample << 16) | (USHORT)Sample;
     }
     SaSnapshot(L"ToneBefore");
     WrAhub(ADMAIF_GLOBAL_ENABLE, 1);
@@ -338,9 +442,10 @@ static VOID SaTestTone(VOID)
     WrAdma(ADMA_CH_FIFO_CTRL, ADMA_FIFO_TX3);
     WrAdma(ADMA_CH_CONFIG, ADMA_CONFIG(1));
     WrAdma(ADMA_CH_CMD, 1);
-    SaSleepMs(500);
+    SaSleepMs(200);
     SaSnapshot(L"Tone");
-    SaSleepMs(500);
+    SaSleepMs(PlayMs > 200 ? PlayMs - 200 : 0);
+    SaSnapshot(L"ToneEnd");
     SaAdmaStop();
     SaSleepMs(5);
     MmFreeContiguousMemory(Words);
@@ -1013,16 +1118,34 @@ static NTSTATUS SaSpbOpen(PRESOURCELIST ResourceList)
                         FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
 }
 
-/* Unmute the output the jack picks, the other one first muted. */
+/* Unmute the output the jack picks, the other one first muted.
+ * 1.0.0.17: the codec was left at the firmware's -18 dB (speaker) and -24 dB
+ * (headphones) while Windows attenuates in software (this miniport has no
+ * volume node), so full system volume was still 18 dB down. Both levels are
+ * now registry tunables: the register holds one 6-bit index per channel,
+ * index 8 = 0 dB, index 0 = +12 dB, 1.5 dB per step.
+ *   Parameters\SpkLevel (default 8 = 0 dB)   Parameters\HpLevel (default 8)
+ * A value above 0x3F is taken as the raw 16-bit word. */
+static ULONG SaVolWord(ULONG Level)
+{
+    if (Level <= 0x3F) return ((Level & 0x3Fu) << 8) | (Level & 0x3Fu);
+    return Level & 0x3FFFu;
+}
+
 static NTSTATUS SaJackApply(BOOLEAN Headphones)
 {
     NTSTATUS Status;
+    ULONG Spk = SaVolWord(SaReadParamEx(L"SpkLevel", 8));
+    ULONG Hp = SaVolWord(SaReadParamEx(L"HpLevel", 8));
+
+    SaTrace(L"SpkVolumeWord", Spk);
+    SaTrace(L"HpVolumeWord", Hp);
     if (Headphones) {
-        Status = SaCodecWrite(RT5640_SPK_VOL, SA_SPK_VOL | SA_MUTE);
-        if (NT_SUCCESS(Status)) Status = SaCodecWrite(RT5640_HP_VOL, SA_HP_VOL);
+        Status = SaCodecWrite(RT5640_SPK_VOL, (USHORT)(Spk | SA_MUTE));
+        if (NT_SUCCESS(Status)) Status = SaCodecWrite(RT5640_HP_VOL, (USHORT)Hp);
     } else {
-        Status = SaCodecWrite(RT5640_HP_VOL, SA_HP_VOL | SA_MUTE);
-        if (NT_SUCCESS(Status)) Status = SaCodecWrite(RT5640_SPK_VOL, SA_SPK_VOL);
+        Status = SaCodecWrite(RT5640_HP_VOL, (USHORT)(Hp | SA_MUTE));
+        if (NT_SUCCESS(Status)) Status = SaCodecWrite(RT5640_SPK_VOL, (USHORT)Spk);
     }
     return Status;
 }
@@ -1069,6 +1192,74 @@ static VOID SaJackStop(VOID)
     }
 }
 
+static NTSTATUS SaCodecUpdate(UCHAR Reg, USHORT Clear, USHORT Set)
+{
+    USHORT Value = 0;
+    NTSTATUS Status = SaCodecRead(Reg, &Value);
+    if (!NT_SUCCESS(Status)) return Status;
+    return SaCodecWrite(Reg, (USHORT)((Value & ~Clear) | Set));
+}
+
+static VOID SaCodecPriv(UCHAR Index, USHORT Value)
+{
+    if (NT_SUCCESS(SaCodecWrite(RT5640_PRIV_INDEX, Index))) SaCodecWrite(RT5640_PRIV_DATA, Value);
+}
+
+/* 1.0.0.12: bring the codec's speaker path back to the state that the UEFI
+   R395 tone played in. Parameters\CodecFix selects the experiment:
+     bit0  speaker volume 0x0808 (0 dB instead of -18 dB), unmuted
+     bit1  headphone volume muted (-24 dB)
+     bit2  reg 0x29 = 0 (UEFI never wrote it; a reset default that may mute)
+     bit3  full R395 speaker-path re-initialisation (codec reset first)
+     bit4  force the codec's LDO1 enable (GPIO PZ4) high
+   Every write is read back into the registry by SaCodecSnapshot afterwards. */
+static VOID SaCodecFix(ULONG Mask)
+{
+    if (g_Hw.Spb == NULL) return;
+    if (Mask & 0x10) {
+        if (g_Hw.Gpio != NULL) {
+            PULONG Cnf = (PULONG)(g_Hw.Gpio + GPIO_PZ_CNF);
+            PULONG Oe = (PULONG)(g_Hw.Gpio + GPIO_PZ_OE);
+            PULONG Out = (PULONG)(g_Hw.Gpio + GPIO_PZ_OUT);
+            ULONG OeNow = READ_REGISTER_ULONG(Oe);
+            WRITE_REGISTER_ULONG(Cnf, READ_REGISTER_ULONG(Cnf) | GPIO_PZ4);
+            WRITE_REGISTER_ULONG(Out, READ_REGISTER_ULONG(Out) | GPIO_PZ4);
+            WRITE_REGISTER_ULONG(Oe, OeNow | GPIO_PZ4);
+            SaTrace(L"CodecLdo1", 1);
+        }
+    }
+    if (Mask & 0x08) {
+        SaTrace(L"CodecReset", (ULONG)SaCodecWrite(RT5640_RESET, 0));
+        SaSleepMs(10);
+        SaCodecPriv(0x3D, 0x3600);
+        SaCodecPriv(0x12, 0x0AA8);
+        SaCodecPriv(0x14, 0x0AAA);
+        SaCodecPriv(0x21, 0xE0E0);
+        SaCodecPriv(0x23, 0x1804);
+        SaTrace(L"FixBias1", (ULONG)SaCodecUpdate(RT5640_PWR_ANLG1, 0, (1u << 15) | (1u << 13) | (1u << 11) | (1u << 4)));
+        SaSleepMs(15);
+        SaTrace(L"FixBias2", (ULONG)SaCodecUpdate(RT5640_PWR_ANLG1, 0, (1u << 14) | (1u << 3)));
+        SaTrace(L"FixMicbias", (ULONG)SaCodecUpdate(0x93, 0, 0x0030));
+        SaTrace(L"FixAnlg2", (ULONG)SaCodecUpdate(RT5640_PWR_ANLG2, 0, 1u << 9));
+        SaTrace(L"FixPll1", (ULONG)SaCodecWrite(RT5640_PLL_CTRL1, (USHORT)((62u << 7) | 2u)));
+        SaTrace(L"FixPll2", (ULONG)SaCodecWrite(RT5640_PLL_CTRL2, 1u << 11));
+        SaTrace(L"FixGlbClk", (ULONG)SaCodecWrite(RT5640_GLB_CLK, (1u << 14) | (1u << 12)));
+        SaTrace(L"FixI2s1", (ULONG)SaCodecWrite(RT5640_I2S1_SDP, 0x8000));
+        SaTrace(L"FixDig1", (ULONG)SaCodecUpdate(RT5640_PWR_DIG1, 0, (1u << 15) | (1u << 12) | (1u << 11) | 1u));
+        SaTrace(L"FixStoDac", (ULONG)SaCodecUpdate(RT5640_STO_DAC_MIXER, (1u << 14) | (1u << 6), 0));
+        SaTrace(L"FixSpkL", (ULONG)SaCodecUpdate(RT5640_SPK_L_MIXER, 1u << 3, 0));
+        SaTrace(L"FixSpkR", (ULONG)SaCodecUpdate(RT5640_SPK_R_MIXER, 1u << 3, 0));
+        SaTrace(L"FixSpoL", (ULONG)SaCodecUpdate(0x48, 1u << 12, 0));
+        SaTrace(L"FixSpoR", (ULONG)SaCodecUpdate(0x49, 1u << 12, 0));
+        SaTrace(L"FixMixer", (ULONG)SaCodecUpdate(RT5640_PWR_MIXER, 0, (1u << 13) | (1u << 12)));
+        SaTrace(L"FixVolume", (ULONG)SaCodecUpdate(RT5640_PWR_VOL, 0, (1u << 15) | (1u << 14)));
+    }
+    if (Mask & 0x04) SaTrace(L"FixReg29", (ULONG)SaCodecWrite(0x29, 0x0000));
+    if (Mask & 0x02) SaTrace(L"FixHpMute", (ULONG)SaCodecWrite(RT5640_HP_VOL, SA_HP_VOL | SA_MUTE));
+    if (Mask & 0x01) SaTrace(L"FixSpkVol", (ULONG)SaCodecWrite(RT5640_SPK_VOL, SA_SPK_VOL_0DB));
+    SaSleepMs(20);
+}
+
 /* Only with UEFI R403 or later: the headphone path set up, PV6 a GPIO input. */
 static VOID SaJackStart(PRESOURCELIST ResourceList)
 {
@@ -1078,7 +1269,11 @@ static VOID SaJackStart(PRESOURCELIST ResourceList)
     HANDLE Thread;
     NTSTATUS Status;
 
-    Status = SaSpbOpen(ResourceList);
+    if (g_Hw.Spb == NULL) {
+        Status = SaSpbOpen(ResourceList);
+    } else {
+        Status = STATUS_SUCCESS;    /* opened early by SaStartDevice for CodecFix */
+    }
     SaTrace(L"JackSpb", (ULONG)Status);
     if (!NT_SUCCESS(Status)) {
         g_Hw.Spb = NULL;
@@ -1086,11 +1281,13 @@ static VOID SaJackStart(PRESOURCELIST ResourceList)
     }
     Status = SaCodecRead(RT5640_HPO_MIXER, &Hpo);
     SaTrace(L"HpoMixer", NT_SUCCESS(Status) ? Hpo : 0xFFFF0000u | (ULONG)(Status & 0xFFFF));
-    Pa.QuadPart = (LONGLONG)GPIO_PHYS;
-    g_Hw.Gpio = (volatile UCHAR *)MmMapIoSpaceEx(Pa, GPIO_LENGTH, PAGE_READWRITE | PAGE_NOCACHE);
-    if (!NT_SUCCESS(Status) || (Hpo & RT5640_M_HPVOL_HM) != 0 || g_Hw.Gpio == NULL) {
-        SaJackStop();
-        return;
+    /* 1.0.0.10: record the codec state at every device start, not only after a
+       jack change, so the inherited UEFI setup can be compared with what the
+       speaker path needs when a stream is silent. */
+    if (NT_SUCCESS(Status)) SaCodecSnapshot();
+    if (g_Hw.Gpio == NULL) {
+        Pa.QuadPart = (LONGLONG)GPIO_PHYS;
+        g_Hw.Gpio = (volatile UCHAR *)MmMapIoSpaceEx(Pa, GPIO_LENGTH, PAGE_READWRITE | PAGE_NOCACHE);
     }
     Cnf = READ_REGISTER_ULONG((volatile ULONG *)(g_Hw.Gpio + GPIO_PV_CNF));
     Oe = READ_REGISTER_ULONG((volatile ULONG *)(g_Hw.Gpio + GPIO_PV_OE));
@@ -1099,6 +1296,15 @@ static VOID SaJackStart(PRESOURCELIST ResourceList)
     if ((Cnf & GPIO_PV6) == 0 || (Oe & GPIO_PV6) != 0) {
         SaJackStop();
         return;
+    }
+    /* 1.0.0.17: apply the level of whichever output the jack picks right away.
+       The polling thread only acts on changes, so without this a console that
+       boots with the headphones already inserted would keep whatever level the
+       firmware left in the codec. */
+    {
+        ULONG Plugged = (READ_REGISTER_ULONG((volatile ULONG *)(g_Hw.Gpio + GPIO_PV_IN)) & GPIO_PV6) == 0 ? 1u : 0u;
+        SaTrace(L"InitialJack", Plugged);
+        (VOID)SaJackApply(Plugged != 0);
     }
     KeClearEvent(&g_Hw.JackStop);
     Status = PsCreateSystemThread(&Thread, THREAD_ALL_ACCESS, NULL, NULL, NULL, SaJackThread, NULL);
@@ -1123,7 +1329,7 @@ static NTSTATUS SaStartDevice(PDEVICE_OBJECT DeviceObject, PIRP Irp, PRESOURCELI
 
     (VOID)RtlCreateRegistryKey(RTL_REGISTRY_SERVICES, g_ParamsPath);
     SaTrace(L"Stage", 1);
-    SaTrace(L"DriverVersion", 9);
+    SaTrace(L"DriverVersion", 17);
     Mem0 = ResourceList->FindTranslatedEntry(CmResourceTypeMemory, 0);
     Mem1 = ResourceList->FindTranslatedEntry(CmResourceTypeMemory, 1);
     if (Mem0 == NULL || Mem1 == NULL || Mem0->u.Memory.Length < AHUB_LENGTH || Mem1->u.Memory.Length < ADMA_LENGTH) {
@@ -1158,6 +1364,7 @@ static NTSTATUS SaStartDevice(PDEVICE_OBJECT DeviceObject, PIRP Irp, PRESOURCELI
     SaTrace(L"Stage", 2);
     // These always-on registers expose the electrical/clock state inherited
     // from firmware; AHUB activity alone cannot prove signals reach the codec.
+    SaAudioPads18V();
     SaTrace(L"PadPower", ReadPhys(PMC_PHYS + 0x44));
     SaTrace(L"PadVoltageEnable", ReadPhys(PMC_PHYS + 0x48));
     SaTrace(L"PadVoltage", ReadPhys(PMC_PHYS + 0xE4));
@@ -1171,8 +1378,35 @@ static NTSTATUS SaStartDevice(PDEVICE_OBJECT DeviceObject, PIRP Irp, PRESOURCELI
     SaTrace(L"ClockSpare", ReadPhys(CAR_PHYS + 0x55C));
     SaTrace(L"I2sTiming", RdAhub(0x10A4));
     SaSnapshot(L"Start");
-    if (SaReadParam(L"TestTone") != 0) {
-        SaTestTone();
+    /* 1.0.0.12: open the codec early so Parameters\CodecFix can run before the
+       tone, and record the codec's LDO1 enable (GPIO PZ4) either way. */
+    if (g_Hw.Spb == NULL) {
+        Status = SaSpbOpen(ResourceList);
+        SaTrace(L"SpbEarly", (ULONG)Status);
+        if (!NT_SUCCESS(Status)) g_Hw.Spb = NULL;
+    }
+    if (g_Hw.Gpio == NULL) {
+        PHYSICAL_ADDRESS Pa;
+        Pa.QuadPart = (LONGLONG)GPIO_PHYS;
+        g_Hw.Gpio = (volatile UCHAR *)MmMapIoSpaceEx(Pa, GPIO_LENGTH, PAGE_READWRITE | PAGE_NOCACHE);
+    }
+    if (g_Hw.Gpio != NULL) {
+        SaTrace(L"CodecLdo1Cnf", READ_REGISTER_ULONG((volatile ULONG *)(g_Hw.Gpio + GPIO_PZ_CNF)));
+        SaTrace(L"CodecLdo1Oe", READ_REGISTER_ULONG((volatile ULONG *)(g_Hw.Gpio + GPIO_PZ_OE)));
+        SaTrace(L"CodecLdo1Out", READ_REGISTER_ULONG((volatile ULONG *)(g_Hw.Gpio + GPIO_PZ_OUT)));
+        SaTrace(L"CodecLdo1In", READ_REGISTER_ULONG((volatile ULONG *)(g_Hw.Gpio + GPIO_PZ_IN)));
+    }
+    {
+        ULONG CodecFix = SaReadParam(L"CodecFix");
+        if (CodecFix != 0 && g_Hw.Spb != NULL) {
+            SaTrace(L"CodecFix", CodecFix);
+            SaCodecFix(CodecFix);
+            SaCodecSnapshot();
+        }
+    }
+    {
+        ULONG ToneLevel = SaReadParam(L"TestTone");
+        if (ToneLevel != 0) SaTestTone(ToneLevel);
     }
 
     Wave = SA_NEW CSaWave();
