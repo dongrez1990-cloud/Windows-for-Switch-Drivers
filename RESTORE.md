@@ -109,8 +109,10 @@ updater2p=1
 bootprotect=0
 ```
 
-卡上 `V:\switchroot\winx-gpu0\` 里还有 16 个历史回滚镜像（`bl33-v49/v50/v51-held/…/v67-held/v68-held`），
-**本备份只带了当前 v72 和 v68-held 两个**，其余仍在卡上。
+卡上 `V:\switchroot\winx-gpu0\` 里还有 16 个历史回滚镜像（`bl33-v49/v50/v51-held/…/v67-held/v68-held`）。
+本 git 备份只带当前 v72 与 v68-held 两个；**其余全部 + `bootloader\` + `EFI\` 已在本地完整备份**：
+`D:\paopao\backup-20261121-sd\`（103.7 MB，含 17 个 bl33 镜像、hekate 全套、完整 EFI（robocopy /B）、
+BCD 导出、两个已验证 sha256 的 tar，恢复步骤见该目录 `README.md`）。
 
 ### SDR104 / DDR200 实验失败后的恢复
 
