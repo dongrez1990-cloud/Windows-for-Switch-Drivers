@@ -82,3 +82,53 @@ Get-Content MANIFEST.sha256 | ForEach-Object {
 - `DwmFlush` 节奏不等于刷新率（CPU 忙时从 46.9 掉到 19.9 fps），测刷新率用小窗口 vsync 限速法（≈63.7 Hz）；
 - 驱动只暴露**一个模式一个方向**（1280×720 @ 90°），`ChangeDisplaySettingsEx` 对 720×1280 与 orient=0 都返回
   `DISP_CHANGE_BADMODE`，所以"改设置做旋转 A/B"在当前驱动下走不通。
+
+## 5. 固件与启动项（本备份已包含，SDR104/DDR200 实验最需要的部分）
+
+SD 卡在控制台上挂成 **`V:`**（`V:\` 就是 hekate/UEFI 那个 FAT 分区）。已从卡上拷出：
+
+| 文件（`firmware\` 内） | 来源 | 大小 | SHA256（前 16 位） |
+|---|---|---|---|
+| `bl33-v72.bin` | `V:\switchroot\winx-gpu0\bl33.bin` | 1,048,576 B | `F766B207E89489F5`（与交接记录里的 v72 完全一致 ✓） |
+| `bl33-v68-held.bin` | `V:\switchroot\winx-gpu0\bl33-v68-held.bin` | 1,048,576 B | `8E0987C7DCAD7BAC` |
+| `hekate_ipl.ini` | `V:\bootloader\hekate_ipl.ini` | 132 B | `FB9A1F2221218F31` |
+| `startup.nsh` | `V:\startup.nsh` | 410 B | `A0EB4EFB2A891333` |
+
+`hekate_ipl.ini` 当前内容（这就是"自动启动到 test 项"的设置）：
+
+```ini
+[config]
+autoboot=6          ; 第 6 项 = 06-swoa-gpu0.ini（GPU0 测试项）
+autoboot_list=1
+bootwait=2
+backlight=100
+noticker=0
+autohosoff=1
+autonogc=1
+updater2p=1
+bootprotect=0
+```
+
+卡上 `V:\switchroot\winx-gpu0\` 里还有 16 个历史回滚镜像（`bl33-v49/v50/v51-held/…/v67-held/v68-held`），
+**本备份只带了当前 v72 和 v68-held 两个**，其余仍在卡上。
+
+### SDR104 / DDR200 实验失败后的恢复
+
+1. **卡还能被 PC 读**（最常见）：把 `firmware\bl33-v72.bin` 覆盖回卡上
+   `switchroot\winx-gpu0\bl33.bin`，把 `firmware\hekate_ipl.ini` 覆盖回 `bootloader\hekate_ipl.ini`
+   → 回到今天这个固件与自动启动设置。
+2. 如果新固件本身有问题、v72 也救不回：用 `firmware\bl33-v68-held.bin` 改名成 `bl33.bin`（更旧的已知可用固件）。
+3. 如果 hekate 自动启动停不下来（一开机就进坏固件）：把 `hekate_ipl.ini` 的 `autoboot` 改成 `0`，
+   或开机时按住 `-` 音量键进 hekate 菜单另选启动项。
+4. 如果卡彻底读不了：换一张卡，把本备份的 `firmware\` 与卡上其它目录恢复过去（Windows 分区需另做镜像）。
+
+## 6. 从 GitHub 取回这份备份
+
+```powershell
+git clone -b backup/20261121-gpu0 git@github.com:dongrez1990-cloud/Windows-for-Switch-Drivers.git woa-gpu0-backup
+# 或 HTTPS：
+git clone -b backup/20261121-gpu0 https://github.com/dongrez1990-cloud/Windows-for-Switch-Drivers.git woa-gpu0-backup
+```
+
+仓库：`dongrez1990-cloud/Windows-for-Switch-Drivers`，分支 **`backup/20261121-gpu0`**
+（与仓库其它分支相互独立，不影响 `erista-0.7.x` / `uefi/erista` 等）。
