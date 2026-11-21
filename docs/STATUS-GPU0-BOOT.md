@@ -1512,3 +1512,14 @@ Register-ScheduledTask -TaskName 'SwitchWOA-SessionProbe' -Action $act -Trigger 
 - **入队 ≠ 上屏**：`BitBlt` 返回只代表 damage 已交；要等 `DwmFlush`（或统计 vsync）才是真实帧率；
 - 驱动只暴露**单一模式+单一方向**（`ChangeDisplaySettingsEx` 对 720×1280 与 orient=0 都返回 `DISP_CHANGE_BADMODE`），
   所以"改设置做 A/B"这条路在当前驱动下走不通，只能靠显示小端口。
+## 26. 2026-11-21 22:3x：本轮收尾 —— 现场已冻结并备份
+
+在转向 SDR104/DDR200（SD 卡速度）之前，把当前可用状态打包备份：
+
+- GitHub：dongrez1990-cloud/Windows-for-Switch-Drivers 分支 **`backup/20261121-gpu0`**（提交 `ff2bcc9`，131 文件）
+- 本地：`D:\paopao\backup-20261121\`（`RESTORE.md` + `MANIFEST.sha256`）与 `D:\paopao\backup-20261121.zip`（2.9 MB，sha256 `0401D57C…`）
+- 含固件：`bl33-v72.bin`（`F766B207E89489F5…`，与 §2 记录一致）、`bl33-v68-held.bin`、`hekate_ipl.ini`、`startup.nsh`
+- 卡上原始物仍在 SD 的 FAT 分区（控制台上是 `V:`）：`V:\switchroot\winx-gpu0\bl33*.bin`（v72 + 16 个历史回滚）、`V:\bootloader\hekate_ipl.ini`
+
+恢复路径（驱动/开关失效、进不了系统、SD 读卡被搞坏）见 `backup-20261121\RESTORE.md`。
+本轮到此暂停；GPU 侧结论见第 16–25 章，显示栈的两次测量更正见第 23 与 25 章。

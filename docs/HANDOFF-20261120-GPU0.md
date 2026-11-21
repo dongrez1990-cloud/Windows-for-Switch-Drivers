@@ -351,3 +351,27 @@ MMU/PFIFO/PMU/ACR/GR 固件 → USERD → golden context → 图形模板 → wo
 
 > 推荐顺序：**A1（已在跑）→ A2 → B2 → B1 → A3/A4 → C1 → D1**。
 > 前四项都不需要重新思考架构，且能把"20 fps 是上屏链路 CPU 代价"这条结论变成实际收益。
+
+---
+
+## 13. 备份位置（2026-11-21 22:3x，为 SDR104/DDR200 实验做的保险）
+
+| 形式 | 位置 | 校验 |
+|---|---|---|
+| **GitHub 分支** | `dongrez1990-cloud/Windows-for-Switch-Drivers` → 分支 **`backup/20261121-gpu0`**（提交 `ff2bcc9`，131 个文件） | 与其它分支相互独立，不影响 `erista-0.7.x` / `uefi/erista` |
+| **本地目录** | `D:\paopao\backup-20261121\`（含 `RESTORE.md`、`MANIFEST.sha256`） | 131 个文件逐条 SHA256 |
+| **本地压缩包** | `D:\paopao\backup-20261121.zip`（2.9 MB） | sha256 `0401D57C9369E087…` |
+| **卡上原始物** | `V:\` = SD 的 FAT 分区（`V:\switchroot\winx-gpu0\bl33*.bin`、`V:\bootloader\hekate_ipl.ini`） | v72 = `F766B207E89489F5…`（与本文 §2 记录一致） |
+
+备份内容：`docs\`（STATUS 全 26 章 + 本文）、`tools\`、`tests\`、`kmd-package\`（0.1.0.112 签名包）、
+`driver-src\t210\` 与 `driver-src\windows\`（本轮改过的三个文件）、`deploy-scripts\`、`console-scripts\`
+（session 探针 1/2/3/4/5b/5c/5d/5e）、`firmware\`（**bl33 v72 + v68-held + hekate_ipl.ini + startup.nsh**）。
+
+**快照时刻的已知好状态**：KMD `0.1.0.112`（sys `0C78DA6A…`）、注册表**无任何人工开关**（走缺省 =
+`Limit=5`/`Mask=0`/`RgWrite=1`/`ClampNeedsTd=0`/`PriRing=1`/`RailSettleMs=25`/`BootGpuKhz=460800`）、
+`SelfCheck=1`、`GrStage=9`、`measured=460800`、设备 `OK/problem=0`、40 分钟 soak 零故障。
+
+恢复步骤见 `D:\paopao\backup-20261121\RESTORE.md`（含：驱动/开关失效、进不了系统、**SD 速度实验把读卡拉坏** 三条路径）。
+
+> 做 SDR104/DDR200 之前建议再做一件事：把卡上 `switchroot\winx-gpu0\` **整个目录**（含 16 个历史
+> `bl33-v4x…v67-held.bin`）拷一份到 PC。本次备份只带了 v72 与 v68-held。
