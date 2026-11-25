@@ -1,4 +1,4 @@
-﻿#ifndef NV_T214_SDR104
+#ifndef NV_T214_SDR104
 #define NV_T214_SDR104 0
 #endif
 #ifndef NV_T214_DDR200
@@ -1433,11 +1433,59 @@ typedef struct _SDHC_EXTENSION {
 #if NV_T210_UHS
     /* T210 (Erista) UHS-I state, see src/t210_uhs.h. */
     PUCHAR T210Car, T210Misc, T210Pmc, T210I2c, T210Gpio;
+    PUCHAR T210I2cAlt;      /* 0x7000C500 probe: what the first build used */
     PKEVENT T210Gate;
     HANDLE T210GateHandle;
     BOOLEAN T210Ready, T210Voltage18, T210Tuned, T210Enabled, T210Sdr104;
     ULONG T210Ldo2Value, T210VoltageStatus, T210VoltageFailures, T210InitStatus;
     ULONG T210TuneStatus, T210TuneIterations, T210Tap, T210UhsMux;
+    ULONG T210SigOn, T210SigOff, T210SigStatus, T210SpeedSeen;
+    ULONG T210Hold18V;
+    ULONG T210OcrPatched;
+    ULONG T210OcrFirst, T210OcrUhs, T210OcrFirstCount, T210OcrUhsCount;
+    /* Bounce-buffer DMA: SDPORT keeps using its PIO contract, the miniport
+       moves each data block with ADMA32 out of a non-cached low-memory buffer
+       (the same trick T214 uses), so the device never touches cached memory. */
+    PUCHAR T210Dma;
+    PHYSICAL_ADDRESS T210DmaPa;
+    ULONG T210DmaCapacity, T210DmaLength, T210DmaBlocks, T210DmaRequests;
+    ULONG T210DmaErrors, T210PioFallbacks, T210DmaMaxBlocks;
+    /* DMA is only used after a self-test proves it returns the same bytes as
+       PIO for the same sector (the bounce buffer's physical address is only
+       valid while SDMMC1A's SMMU translation is off). */
+    BOOLEAN T210DmaOk, T210DmaTested;
+    USHORT T210DmaTestIs, T210DmaTestErr, T210DmaTestPs;
+    UCHAR T210DmaTestAdma;
+    ULONG T210Smmu2, T210Smmu3, T210Smmu4;
+    ULONG T210DmaTestResult, T210Smmu, T210DmaTestStDma, T210DmaTestStPio, T210DmaTestOutstanding;
+    ULONG T210DmaSig;               /* 4 bytes at offset 3 of LBA 0, read via ADMA */
+    LONGLONG T210SlotStart;         /* KeQueryInterruptTime() when the slot came up */
+    ULONG T210DmaProbeCalls, T210DmaProbeSkip;
+    USHORT T210Rca;
+    volatile LONG T210DmaTestQueued;
+    ULONG T210DmaLastError, T210DmaLastAdmaError;
+    /* Order-of-events trail (packed four codes per DWORD for the Diag key):
+       1 = SetSignaling(1.8 V), 2 = SetSignaling(3.3 V), 3 = SetSpeed(SDR104),
+       4 = SdhcResetHost, 5 = ExecuteTuning, 6 = SetClock, 7 = SDR104 mode set. */
+    ULONG T210Trace[8];
+    ULONG T210TraceCount;
+    /* Last commands SDPORT issued (byte ring): shows whether CMD11 preceded the
+       1.8 V switch and what came right after it. */
+    ULONG T210Cmd6R1, T210Cmd7R1, T210Cmd13R1;
+    ULONG T210R1Idx[16];            /* rolling: command index of the last 8 */
+    ULONG T210R1Val[16];            /* rolling: full 32-bit R1 of those     */
+    ULONG T210R1Head;
+    ULONG T210R1Count;
+    ULONG T210WinStartLo;
+    ULONG T210WinMs;
+    ULONG T210SnapPs, T210SnapHc2, T210SnapPwr, T210SnapClk, T210SnapIs, T210SnapErr;
+    BOOLEAN T210UhsWindow;
+    ULONG T210Scr[4];
+    ULONG T210FnTable[16];
+    UCHAR T210CmdRing[32];
+    ULONG T210CmdCount;
+    PUCHAR T210DmaTarget;
+    BOOLEAN T210DmaActive, T210DmaComplete, T210DmaFault;
     ULONG T210PllBefore, T210PllAfter, T210CarSource, T210BaseKhz;
 #endif
 } SDHC_EXTENSION, *PSDHC_EXTENSION;
@@ -2185,3 +2233,18 @@ Return value:
 #define MIN(x,y) ((x) > (y) ? (y) : (x))        // return minimum among x & y
 #define MAX(x,y) ((x) > (y) ? (x) : (y))        // return maximum among x & y
 #define DIV_CEIL(x, y) (((x) + (y) - 1) / (y))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

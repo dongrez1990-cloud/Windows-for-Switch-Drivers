@@ -226,11 +226,73 @@ remain unverified until the runtime parameters are read; a successful boot
 alone does not distinguish DDR200 from SDR104.
 
 ```sh
-python3 drivers/Tegra210Sdhc/tests/test-ddr200.py
-python3 drivers/Tegra210Sdhc/tests/test-ddr200-transport.py
-python3 drivers/Tegra210Sdhc/tests/test-t214-context.py
-python3 drivers/Tegra210Sdhc/tests/test-diagnostics.py
+python drivers/Tegra210Sdhc/tests/test-ddr200.py
+python drivers/Tegra210Sdhc/tests/test-ddr200-transport.py
+python drivers/Tegra210Sdhc/tests/test-t214-context.py
+python drivers/Tegra210Sdhc/tests/test-diagnostics.py
+node drivers/Tegra210Sdhc/tests/test-t210-window.js
 ```
 
-References: [Microsoft SD miniport](https://github.com/microsoft/Windows-driver-samples/tree/main/sd/miniport/sdhc)
-and [Switchroot SDHCI transfer limits](https://github.com/CTCaer/switch-l4t-kernel-4.9/blob/linux-5.1.2/drivers/mmc/host/sdhci.c).
+### T210 (Erista / HAC-001) SDR104 candidate
+
+Build with `NV_T210_UHS=1` and `NV_T210_UHS_ACTIVE=1` (both are off by
+default; the normal build never touches 1.8 V, the CAR or tuning):
+
+```powershell
+./tools/Build-Driver.ps1 -Wdm -Name nvtsdhc -Sources drivers/Tegra210Sdhc/src/nvtsdhc.c `
+  -Libs sdport.lib -Defines 'NV_T210_UHS=1','NV_T210_UHS_ACTIVE=1' `
+  -Inf drivers/Tegra210Sdhc/nvtsdhc.inf -OutDir build/Tegra210Sdhc-sdr104
+```
+
+`src/t210_uhs.h` is the whole T210 path. It works from the same board facts as
+the T214 profile (MAX77620 LDO2 is `vqmmc`, GPIO E4 is `vmmc`, SDMMC1 pads at
+APB_MISC `0x3000..0x3014`, PMC bit 12), but it departs from T214 in the three
+places where T210 actually fails:
+
+- **Clock ladder 208 -> 200 -> 150 MHz.** The nominal 208 MHz has no timing
+  margin on T210; reports range from "no interrupt at 208" to "stable only at
+  150". The ladder is built from integer divisors of the single PLLC4 OUT0
+  (998.4 MHz): rung 1/2 = 998.4/5 = 199.68 MHz card clock (SDHCI inline
+  divisor 2), rung 3 = 998.4/7 = 142.63 MHz. The first rung whose sweep finds
+  a usable window wins; the others are recorded in `UhsLadder`/`UhsTuneAttempt`.
+  The PLL is never retuned; only `CLK_SOURCE_SDMMC1` (CAR `0x150`) changes.
+- **SDR104 pad offsets.** T210's auto-calibration hangs in SDR104 when it
+  inherits the 1.8 V offsets; the 2024 Linux fix
+  (`nvidia,pad-autocal-pull-up-offset-sdr104` / `pull-down-offset-sdr104 = 0`)
+  is implemented in `T210Sdr104Pad()` before `T210PadCalibrate()` runs. The
+  result is visible as `UhsPadCfg` and `UhsPadCal` in the Diag key.
+- **Software tuning instead of the black-box auto-tune.** `T210TuneCfg()`
+  sweeps all 128 taps with CMD19, builds a pass/fail bitmap
+  (`UhsTuneMap0..3`), selects the centre of the widest circular run
+  (`UhsTuneWindow`, `UhsTap`) and freezes that tap through vendor clock
+  control `0x100[23:16]` + `0x1C0` bit 17. It is the same manual-tap mechanism
+  the DDR200 profile already exercised on this console.
+
+When all three rungs fail, `T210Fallback3V3()` restores 3.3 V high speed and
+the SDR104 request fails, so SDPORT keeps the slower mode instead of leaving
+the controller untuned. Diagnostics land under
+`Services\nvtsdhc\Parameters\Diag`: `Uhs1V8`, `UhsTuned`, `UhsTunedKhz`,
+`UhsTuneAttempt`, `UhsTuneWindow`, `UhsTap`, `UhsTuneStatus`, `UhsPadCal`,
+`UhsTuneMap0..3`, `UhsCarSource`, plus the existing `ClockKhz*`/`BusSpeed`.
+
+**This is compiled and statically verified only.** ARM64 builds pass for the
+default, inert, active, no-diagnostics and registry-thread profiles, and the
+window selection is unit-tested
+(`tests/test-t210-window.js`). Nothing has been run on a T210 console yet:
+physical signalling, the pad hang fix and the 208/200/150 tunability are
+open questions until the Diag values above are read back after a boot.
+`WoA\DDR200-T210-清单.md` is the porting checklist this code follows. Keep the
+backup in `backup-20261121-sd` before booting the first active build: the SD
+card is the boot disk.
+
+Open item: a colleague's note links the Bluetooth 1.8 V rail to SDR104
+stability. The Switch Bluetooth module does sit on a 1.8 V purple rail, but
+there is no public document tying that rail to SDMMC1 calibration, so this is
+left unverified. If it ever reproduces, compare the `UhsPadCal`/`UhsTuneWindow`
+readbacks with Bluetooth powered and unpowered, and check whether SDMMC1 and
+the Bluetooth rail share a PMC power domain or pad group.
+
+References: [Microsoft SD miniport](https://github.com/microsoft/Windows-driver-samples/tree/main/sd/miniport/sdhc),
+[Switchroot SDHCI transfer limits](https://github.com/CTCaer/switch-l4t-kernel-4.9/blob/linux-5.1.2/drivers/mmc/host/sdhci.c),
+[Hekate SDMMC](https://github.com/CTCaer/hekate/blob/v6.5.3/bdk/storage/sdmmc_driver.c) and
+[the Tegra X1 SDR104 pad-offset fix](https://www.spinics.net/lists/linux-tegra/msg79659.html).
